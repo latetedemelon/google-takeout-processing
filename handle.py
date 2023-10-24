@@ -50,6 +50,15 @@ def unpack_zip(zip_path, extract_to):
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
+            for file in os.listdir(extract_to):
+                file_path = os.path.join(extract_to, file)
+                size = os.path.getsize(file_path)
+                md5_hash = generate_hash(file_path)
+                with conn:
+                    c.execute("""
+                        INSERT INTO FileList (file_name, status, size, md5_hash)
+                        VALUES (?, ?, ?, ?)
+                    """, (file, 'extracted', size, md5_hash))
             status = 'Success'
             error_message = ''
     except Exception as e:
@@ -124,15 +133,34 @@ def deduplicate_phase_two(dest_dir):
         # ... matching logic ...
         pass  # Implement the similar name matching and size comparison
 
-def update_exif_data(file_path, new_data):
+def unpack_zip(zip_path, extract_to):
     try:
-        image = Image.open(file_path)
-        exif_data = {TAGS[key]: value for key, value in image._getexif().items() if key in TAGS}
-        exif_data.update(new_data)
-        # ... save updated exif data ...
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+            for file in os.listdir(extract_to):
+                file_path = os.path.join(extract_to, file)
+                size = os.path.getsize(file_path)
+                md5_hash = generate_hash(file_path)
+                with conn:
+                    c.execute("""
+                        INSERT INTO FileList (file_name, status, size, md5_hash)
+                        VALUES (?, ?, ?, ?)
+                    """, (file, 'extracted', size, md5_hash))
+            status = 'Success'
+            error_message = ''
     except Exception as e:
-        # Handle exception
-        pass
+        status = 'Failed'
+        error_message = str(e)
+    finally:
+        with conn:
+            c.execute("""
+                INSERT INTO ZipProcessing (zip_file, status, error_message)
+                VALUES (?, ?, ?)
+            """, (zip_path, status, error_message))
+
+def find_json_sidecar(file_path):
+    # Implement logic to find the corresponding JSON sidecar for a given file
+    pass
 
 def process_json_sidecar(json_path):
     with open(json_path, 'r') as f:
@@ -167,13 +195,6 @@ def process_files(dest_dir):
         else:
             # ... other processing logic ...
             pass
-
-def main():
-    # ... (same as before)
-    deduplicate_phase_one(destination_dir)
-    deduplicate_phase_two(destination_dir)
-    process_files(destination_dir)
-
 
 def main():
     # Main function to execute script
