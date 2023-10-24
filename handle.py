@@ -12,16 +12,58 @@ conn = sqlite3.connect('processing_log.db')
 c = conn.cursor()
 
 def create_tables():
-    # Create tables for logging
-    pass
+    with conn:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ZipProcessing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zip_file TEXT,
+                status TEXT,
+                error_message TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS FileProcessing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_name TEXT,
+                status TEXT,
+                error_message TEXT
+            )
+        """)
 
 def unpack_zip(zip_path, extract_to):
-    # Unpack zip files
-    pass
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+            status = 'Success'
+            error_message = ''
+    except Exception as e:
+        status = 'Failed'
+        error_message = str(e)
+    finally:
+        with conn:
+            c.execute("""
+                INSERT INTO ZipProcessing (zip_file, status, error_message)
+                VALUES (?, ?, ?)
+            """, (zip_path, status, error_message))
 
 def centralize_files(src_dir, dest_dir):
-    # Centralize all files in the same directory
-    pass
+    try:
+        files_list = os.listdir(src_dir)
+        for file in files_list:
+            shutil.move(os.path.join(src_dir, file), os.path.join(dest_dir, file))
+        status = 'Success'
+        error_message = ''
+    except Exception as e:
+        status = 'Failed'
+        error_message = str(e)
+    finally:
+        # Assuming every file move is logged into the database
+        with conn:
+            for file in files_list:
+                c.execute("""
+                    INSERT INTO FileProcessing (file_name, status, error_message)
+                    VALUES (?, ?, ?)
+                """, (file, status, error_message))
 
 def generate_hash(file_path):
     # Generate MD5 hash for a file
