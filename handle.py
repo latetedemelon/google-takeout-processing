@@ -101,36 +101,79 @@ def generate_hash(file_path):
         hasher.update(buf)
     return hasher.hexdigest()
 
-def deduplicate_phase_one(files_list):
-    # Deduplication phase one: based on MD5 hash and size
-    pass
+def deduplicate_phase_one(dest_dir):
+    seen_hashes = {}  # Dictionary to store seen hashes and their corresponding file paths
+    files_list = os.listdir(dest_dir)
+    for file in files_list:
+        file_path = os.path.join(dest_dir, file)
+        size = os.path.getsize(file_path)
+        md5_hash = generate_hash(file_path)
+        if md5_hash in seen_hashes and size == seen_hashes[md5_hash][0]:
+            # This is a duplicate
+            os.remove(file_path)
+            update_file_status(file, 'deleted')
+        else:
+            seen_hashes[md5_hash] = (size, file_path)
+            update_file_status(file, 'centralized')
 
-def deduplicate_phase_two(files_list):
-    # Deduplication phase two: based on similar names and same size
-    pass
-
-def get_exif_data(file_path):
-    # Get EXIF data from an image
-    pass
+def deduplicate_phase_two(dest_dir):
+    files_list = os.listdir(dest_dir)
+    # This might require a more complex logic to match similar filenames
+    # and compare sizes, for now it's simplified
+    for file in files_list:
+        # ... matching logic ...
+        pass  # Implement the similar name matching and size comparison
 
 def update_exif_data(file_path, new_data):
-    # Update EXIF data for an image
-    pass
+    try:
+        image = Image.open(file_path)
+        exif_data = {TAGS[key]: value for key, value in image._getexif().items() if key in TAGS}
+        exif_data.update(new_data)
+        # ... save updated exif data ...
+    except Exception as e:
+        # Handle exception
+        pass
 
 def process_json_sidecar(json_path):
-    # Process JSON sidecar file to extract necessary data
-    pass
+    with open(json_path, 'r') as f:
+        sidecar_data = json.load(f)
+    # Extract necessary data from sidecar_data and return it
+    return {
+        'geoData': sidecar_data.get('geoData', {}),
+        'geoDataExif': sidecar_data.get('geoDataExif', {}),
+        'photoTakenTime': sidecar_data.get('photoTakenTime', {}),
+        'creationTime': sidecar_data.get('creationTime', {})
+    }
 
 def extract_date_from_filename(filename):
-    # Extract date from filename
+    # Implement the logic to extract the date from filename
     pass
 
-def process_files(files_dir):
-    # Main function to process all files
-    files_list = os.listdir(files_dir)
+def update_file_status(file_name, status):
+    with conn:
+        c.execute("""
+            UPDATE FileList
+            SET status = ?
+            WHERE file_name = ?
+        """, (status, file_name))
+
+def process_files(dest_dir):
+    files_list = os.listdir(dest_dir)
     for file in files_list:
-        # ... processing logic ...
-        pass
+        file_path = os.path.join(dest_dir, file)
+        if file.endswith('.json'):
+            json_data = process_json_sidecar(file_path)
+            # ... logic to update corresponding image/video file ...
+        else:
+            # ... other processing logic ...
+            pass
+
+def main():
+    # ... (same as before)
+    deduplicate_phase_one(destination_dir)
+    deduplicate_phase_two(destination_dir)
+    process_files(destination_dir)
+
 
 def main():
     # Main function to execute script
