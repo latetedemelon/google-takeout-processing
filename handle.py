@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import sqlite3
 import json
+import Levenshtein
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 
@@ -125,13 +126,33 @@ def deduplicate_phase_one(dest_dir):
             seen_hashes[md5_hash] = (size, file_path)
             update_file_status(file, 'centralized')
 
-def deduplicate_phase_two(dest_dir):
+def deduplicate_phase_two(dest_dir, threshold=0.8):
     files_list = os.listdir(dest_dir)
-    # This might require a more complex logic to match similar filenames
-    # and compare sizes, for now it's simplified
+    checked_files = set()  # Keep track of files that have been checked
     for file in files_list:
-        # ... matching logic ...
-        pass  # Implement the similar name matching and size comparison
+        file_path = os.path.join(dest_dir, file)
+        size = os.path.getsize(file_path)
+        for compare_file in files_list:
+            if file != compare_file and compare_file not in checked_files:
+                compare_file_path = os.path.join(dest_dir, compare_file)
+                compare_size = os.path.getsize(compare_file_path)
+                if size == compare_size:
+                    similarity = levenshtein_similarity(file, compare_file)
+                    if similarity >= threshold:
+                        # Files are similar and have the same size, delete the duplicate
+                        os.remove(compare_file_path)
+                        update_file_status(compare_file, 'deleted')
+                        checked_files.add(compare_file)
+        checked_files.add(file)
+
+def levenshtein_similarity(s1, s2):
+    """Calculate the normalized Levenshtein similarity of two strings."""
+    max_len = max(len(s1), len(s2))
+    if max_len == 0:
+        return 1.0  # both strings are empty
+    distance = Levenshtein.distance(s1, s2)
+    similarity = 1 - distance / max_len
+    return similarity
 
 def unpack_zip(zip_path, extract_to):
     try:
