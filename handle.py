@@ -126,38 +126,48 @@ def generate_hash(file_path):
     return hasher.hexdigest()
     
 def deduplicate_phase_one(dest_dir):
-    files_list = fetch_centralized_files()
-    seen_hashes = {}  # Dictionary to store seen hashes and their corresponding file paths
-    for file in files_list:
-        file_path = os.path.join(dest_dir, file)
-        size = os.path.getsize(file_path)
-        md5_hash = generate_hash(file_path)
-        if md5_hash in seen_hashes:
-            # This is a duplicate
-            os.remove(file_path)
-            update_file_status(file, 'deleted')
-        else:
-            seen_hashes[md5_hash] = (size, file_path)
+    try:
+        files_list = fetch_centralized_files()
+        seen_hashes = {}  # Dictionary to store seen hashes and their corresponding file paths
+        for file in files_list:
+            file_path = os.path.join(dest_dir, file)
+            size = os.path.getsize(file_path)
+            md5_hash = generate_hash(file_path)
+            if md5_hash in seen_hashes:
+                # This is a duplicate
+                os.remove(file_path)
+                update_file_status(file, 'deleted')
+            else:
+                seen_hashes[md5_hash] = (size, file_path)
+    except Exception as e:
+        status = 'Deduplication Phase 1 Failed'
+        error_message = str(e)
+        logging.error(f'Failed to dedup files: {error_message}')
 
 def deduplicate_phase_two(dest_dir, threshold=0.8):
-    files_list = fetch_centralized_files()
-    checked_files = set()  # Keep track of files that have been checked
-    for file in files_list:
-        file_path = os.path.join(dest_dir, file)
-        size = os.path.getsize(file_path)
-        for compare_file in files_list:
-            if file != compare_file and compare_file not in checked_files:
-                compare_file_path = os.path.join(dest_dir, compare_file)
-                compare_size = os.path.getsize(compare_file_path)
-                if size == compare_size:
-                    similarity = levenshtein_similarity(file, compare_file)
-                    if similarity >= threshold:
-                        # Files are similar and have the same size, delete the duplicate
-                        os.remove(compare_file_path)
-                        update_file_status(compare_file, 'deleted')
-                        checked_files.add(compare_file)
-        checked_files.add(file)
-        update_file_status(file, 'deduped')
+    try:
+        files_list = fetch_centralized_files()
+        checked_files = set()  # Keep track of files that have been checked
+        for file in files_list:
+            file_path = os.path.join(dest_dir, file)
+            size = os.path.getsize(file_path)
+            for compare_file in files_list:
+                if file != compare_file and compare_file not in checked_files:
+                    compare_file_path = os.path.join(dest_dir, compare_file)
+                    compare_size = os.path.getsize(compare_file_path)
+                    if size == compare_size:
+                        similarity = levenshtein_similarity(file, compare_file)
+                        if similarity >= threshold:
+                            # Files are similar and have the same size, delete the duplicate
+                            os.remove(compare_file_path)
+                            update_file_status(compare_file, 'deleted')
+                            checked_files.add(compare_file)
+            checked_files.add(file)
+            update_file_status(file, 'deduped')
+    except Exception as e:
+        status = 'Deduplication Phase 2 Failed'
+        error_message = str(e)
+        logging.error(f'Failed to dedup files: {error_message}')
 
 def levenshtein_similarity(s1, s2):
     """Calculate the normalized Levenshtein similarity of two strings."""
