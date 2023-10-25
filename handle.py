@@ -308,6 +308,18 @@ def update_file_status(file_name, status):
             WHERE file_name = ?
         """, (status, file_name))
 
+def process_files(dest_dir):
+    with conn:
+        c.execute("SELECT file_name FROM FileList WHERE status != 'deleted'")
+        files = c.fetchall()
+    for file_tuple in files:
+        file_name = file_tuple[0]
+        file_path = os.path.join(dest_dir, file_name)
+        print(f'Processing {file_name}...')
+        process_image_exif(file_path)
+        update_file_status(file_name, 'processed')
+        print(f'{file_name} processed.')
+
 def main():
     # Main function to execute script
     source_dir = 'path_to_source'
@@ -320,6 +332,7 @@ def main():
     deduplicate_phase_one(files_list)
     deduplicate_phase_two(files_list)
     process_files(destination_dir)
+    print('Processing completed.')
 
 if __name__ == "__main__":
     main()
