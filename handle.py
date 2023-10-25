@@ -6,7 +6,7 @@ import os
 import hashlib
 import shutil
 import sqlite3
-import Levenshtein
+import levenshtein
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import pyexiv2
