@@ -10,6 +10,10 @@ import Levenshtein
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 import pyexiv2
+import logging
+
+# Setup logging
+logging.basicConfig(filename='script.log', level=logging.INFO)
 
 # Define the database connection
 conn = sqlite3.connect('processing_log.db')
@@ -68,6 +72,7 @@ def unpack_zip(zip_path, extract_to):
     except Exception as e:
         status = 'Failed'
         error_message = str(e)
+        logging.error(f'Failed to unpack {zip_path}: {error_message}')
     finally:
         with conn:
             c.execute("""
@@ -85,6 +90,7 @@ def centralize_files(src_dir, dest_dir):
     except Exception as e:
         status = 'Failed'
         error_message = str(e)
+        logging.error(f'Failed to centralize files: {error_message}')
     finally:
         # Assuming every file move is logged into the database
         with conn:
@@ -234,46 +240,53 @@ def update_exif_data(file_path, new_data):
     metadata.write()
 
 def process_image_exif(file_path):
-    image = Image.open(file_path)
-    exif_data = {TAGS[key]: value for key, value in image._getexif().items() if key in TAGS}
+    try:
+        image = Image.open(file_path)
+        exif_data = {TAGS[key]: value for key, value in image._getexif().items() if key in TAGS}
+  
+        date_taken = exif_data.get('DateTimeOriginal')
+        gps_info = exif_data.get('GPSInfo')
+      
+        json_sidecar_path = find_json_sidecar(file_path)
+        json_data = None
+      
+        if json_sidecar_path:
+            with open(json_sidecar_path, 'r') as f:
+                json_data = json.load(f)
+      
+        if not date_taken:
+            update_date_exif(file_path, json_data)
+    
+        if not gps_info:
+            update_gps_exif(file_path, json_data)
+    except Exception as e:
+        logging.error(f'Failed to process EXIF data for {file_path}: {str(e)}')
 
-    date_taken = exif_data.get('DateTimeOriginal')
-    gps_info = exif_data.get('GPSInfo')
-    
-    json_sidecar_path = find_json_sidecar(file_path)
-    json_data = None
-    
-    if json_sidecar_path:
-        with open(json_sidecar_path, 'r') as f:
-            json_data = json.load(f)
-    
-    if not date_taken:
-        update_date_exif(file_path, json_data)
-    
-    if not gps_info:
-        update_gps_exif(file_path, json_data)
 
 def update_date_exif(file_path, json_data):
-    new_date = None
+    try:
+        new_date = None
     
-    if json_data:
-        photo_taken_time = json_data.get('photoTakenTime', {}).get('timestamp')
-        creation_time = json_data.get('creationTime', {}).get('timestamp')
+        if json_data:
+            photo_taken_time = json_data.get('photoTakenTime', {}).get('timestamp')
+            creation_time = json_data.get('creationTime', {}).get('timestamp')
         
-        if photo_taken_time:
-            new_date = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
-        elif creation_time:
-            new_date = datetime.utcfromtimestamp(int(creation_time)).strftime('%Y:%m:%d %H:%M:%S')
+            if photo_taken_time:
+                new_date = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
+            elif creation_time:
+                new_date = datetime.utcfromtimestamp(int(creation_time)).strftime('%Y:%m:%d %H:%M:%S')
     
-    if not new_date:
-        new_date = extract_date_from_filename(file_path)
+        if not new_date:
+            new_date = extract_date_from_filename(file_path)
     
-    if new_date:
-        new_exif_data = {'DateTimeOriginal': new_date}
-        update_exif_data(file_path, new_exif_data)
+        if new_date:
+            new_exif_data = {'DateTimeOriginal': new_date}
+            update_exif_data(file_path, new_exif_data)
+    except Exception as e:
+        logging.error(f'Failed to update EXIF data for {file_path}: {str(e)}')
+
     
-    
-def update_gps(file_path, gps_info, json_data):
+def update_gps_exif(file_path, gps_info, json_data):
     if not json_data:
         # Proceed to the next stage
         return
@@ -315,13 +328,17 @@ def process_files(dest_dir):
     for file_tuple in files:
         file_name = file_tuple[0]
         file_path = os.path.join(dest_dir, file_name)
-        print(f'Processing {file_name}...')
+        print(f'Processing {file_name}...')  # User update
+        logging.info(f'Processing {file_name}...')
         process_image_exif(file_path)
         update_file_status(file_name, 'processed')
-        print(f'{file_name} processed.')
+        print(f'{file_name} processed.')  # User update
+        logging.info(f'{file_name} processed.')
 
 def main():
     # Main function to execute script
+    print('Script started...')  # User update
+    logging.info('Script started...')
     source_dir = 'path_to_source'
     destination_dir = 'path_to_destination'
     tmp_dir = os.path.join(destination_dir, 'tmp')
@@ -332,7 +349,8 @@ def main():
     deduplicate_phase_one(files_list)
     deduplicate_phase_two(files_list)
     process_files(destination_dir)
-    print('Processing completed.')
+    print('Processing completed.')  # User update
+    logging.info('Processing completed.')
 
 if __name__ == "__main__":
     main()
