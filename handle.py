@@ -79,6 +79,7 @@ def unpack_zip(zip_path, extract_to):
                 INSERT INTO ZipProcessing (zip_file, status, error_message)
                 VALUES (?, ?, ?)
             """, (zip_path, status, error_message))
+        print(f'Processed {zip_path}')
 
 def fetch_unpacked_files():
     with conn:
