@@ -1,12 +1,15 @@
+import json
+import re
+from datetime import datetime
 import zipfile
 import os
 import hashlib
 import shutil
 import sqlite3
-import json
 import Levenshtein
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
+import pyexiv2
 
 # Define the database connection
 conn = sqlite3.connect('processing_log.db')
@@ -180,23 +183,122 @@ def unpack_zip(zip_path, extract_to):
             """, (zip_path, status, error_message))
 
 def find_json_sidecar(file_path):
-    # Implement logic to find the corresponding JSON sidecar for a given file
-    pass
+    # Get the directory and base name of the file
+    directory, filename = os.path.split(file_path)
+    base_name, _ = os.path.splitext(filename)
 
-def process_json_sidecar(json_path):
-    with open(json_path, 'r') as f:
-        sidecar_data = json.load(f)
-    # Extract necessary data from sidecar_data and return it
-    return {
-        'geoData': sidecar_data.get('geoData', {}),
-        'geoDataExif': sidecar_data.get('geoDataExif', {}),
-        'photoTakenTime': sidecar_data.get('photoTakenTime', {}),
-        'creationTime': sidecar_data.get('creationTime', {})
-    }
+    # Create a pattern to match the base name of the file in any JSON sidecar file name
+    pattern = re.compile(re.escape(base_name) + r'.*\.json$', re.IGNORECASE)
+
+    # Look for matching files in the directory
+    for sidecar_name in os.listdir(directory):
+        if pattern.match(sidecar_name):
+            return os.path.join(directory, sidecar_name)
+    
+    return None
 
 def extract_date_from_filename(filename):
-    # Implement the logic to extract the date from filename
-    pass
+    # Look for a sequence of 8 digits in the filename
+    match = re.search(r'(19|20)\d{6}', filename))
+    if match:
+        date_string = match.group(1)
+        try:
+            # Try to convert the 8 digits to a date object
+            date_obj = datetime.strptime(date_string, '%Y%m%d')
+            # Format the date object to the desired format
+            formatted_date = date_obj.strftime('%Y:%m:%d 00:00:00')
+            print(f'Date extracted from {filename}: {formatted_date}')
+            return formatted_date
+        except ValueError:
+            # If conversion fails, the 8 digits do not represent a valid date
+            print(f'Could not extract date from {filename}')
+            pass
+    return None
+
+def convert_to_degrees(value):
+    # Convert decimal degrees to EXIF format (degree, minute, second)
+    degree = int(value)
+    minute = int((value - degree) * 60)
+    second = ((value - degree - minute/60) * 3600)
+    return f"{degree}/1,{minute}/1,{second}/1"
+
+def convert_to_rational(value):
+    # Convert decimal to rational (numerator/denominator) for EXIF format
+    return f"{int(value * 100)}/100"
+
+def update_exif_data(file_path, new_data):
+    metadata = pyexiv2.ImageMetadata(file_path)
+    metadata.read()
+    for tag, value in new_data.items():
+        metadata[tag] = value
+    metadata.write()
+
+def process_image_exif(file_path):
+    image = Image.open(file_path)
+    exif_data = {TAGS[key]: value for key, value in image._getexif().items() if key in TAGS}
+
+    date_taken = exif_data.get('DateTimeOriginal')
+    gps_info = exif_data.get('GPSInfo')
+    
+    json_sidecar_path = find_json_sidecar(file_path)
+    json_data = None
+    
+    if json_sidecar_path:
+        with open(json_sidecar_path, 'r') as f:
+            json_data = json.load(f)
+    
+    if not date_taken:
+        update_date_exif(file_path, json_data)
+    
+    if not gps_info:
+        update_gps_exif(file_path, json_data)
+
+def update_date_exif(file_path, json_data):
+    new_date = None
+    
+    if json_data:
+        photo_taken_time = json_data.get('photoTakenTime', {}).get('timestamp')
+        creation_time = json_data.get('creationTime', {}).get('timestamp')
+        
+        if photo_taken_time:
+            new_date = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
+        elif creation_time:
+            new_date = datetime.utcfromtimestamp(int(creation_time)).strftime('%Y:%m:%d %H:%M:%S')
+    
+    if not new_date:
+        new_date = extract_date_from_filename(file_path)
+    
+    if new_date:
+        new_exif_data = {'DateTimeOriginal': new_date}
+        update_exif_data(file_path, new_exif_data)
+    
+    
+def update_gps(file_path, gps_info, json_data):
+    if not json_data:
+        # Proceed to the next stage
+        return
+    
+    new_gps_data = {}
+    geo_data_exif = json_data.get('geoDataExif', {})
+    geo_data = json_data.get('geoData', {})
+    
+   if geo_data_exif.get('latitude') and geo_data_exif.get('longitude'):
+        new_gps_data = {
+            GPSTAGS['GPSLatitude']: convert_to_degrees(geo_data_exif['latitude']),
+            GPSTAGS['GPSLongitude']: convert_to_degrees(geo_data_exif['longitude']),
+            GPSTAGS['GPSAltitude']: convert_to_rational(geo_data_exif.get('altitude', 0))
+        }
+    elif geo_data.get('latitude') and geo_data.get('longitude'):
+        new_gps_data = {
+            GPSTAGS['GPSLatitude']: convert_to_degrees(geo_data['latitude']),
+            GPSTAGS['GPSLongitude']: convert_to_degrees(geo_data['longitude']),
+            GPSTAGS['GPSAltitude']: convert_to_rational(geo_data.get('altitude', 0))
+        }
+    
+    if new_gps_data:
+        new_exif_data = {'GPSInfo': new_gps_data}
+        update_exif_data(file_path, {'GPSInfo': new_exif_data})
+
 
 def update_file_status(file_name, status):
     with conn:
@@ -205,17 +307,6 @@ def update_file_status(file_name, status):
             SET status = ?
             WHERE file_name = ?
         """, (status, file_name))
-
-def process_files(dest_dir):
-    files_list = os.listdir(dest_dir)
-    for file in files_list:
-        file_path = os.path.join(dest_dir, file)
-        if file.endswith('.json'):
-            json_data = process_json_sidecar(file_path)
-            # ... logic to update corresponding image/video file ...
-        else:
-            # ... other processing logic ...
-            pass
 
 def main():
     # Main function to execute script
