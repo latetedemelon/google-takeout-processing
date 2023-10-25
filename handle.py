@@ -85,7 +85,7 @@ def centralize_files(src_dir, dest_dir):
         files_list = os.listdir(src_dir)
         for file in files_list:
             shutil.move(os.path.join(src_dir, file), os.path.join(dest_dir, file))
-        status = 'Success'
+        update_file_status(file_name, 'centralized')
         error_message = ''
     except Exception as e:
         status = 'Failed'
@@ -99,6 +99,11 @@ def centralize_files(src_dir, dest_dir):
                     INSERT INTO FileProcessing (file_name, status, error_message)
                     VALUES (?, ?, ?)
                 """, (file, status, error_message))
+
+def fetch_centralized_files():
+    with conn:
+        c.execute("SELECT file_name FROM FileList WHERE status = 'centralized'")
+        return [row[0] for row in c.fetchall()]
 
 def generate_file_list(src_dir):
     files_list = os.listdir(src_dir)
@@ -121,22 +126,21 @@ def generate_hash(file_path):
     return hasher.hexdigest()
     
 def deduplicate_phase_one(dest_dir):
+    files_list = fetch_centralized_files()
     seen_hashes = {}  # Dictionary to store seen hashes and their corresponding file paths
-    files_list = os.listdir(dest_dir)
     for file in files_list:
         file_path = os.path.join(dest_dir, file)
         size = os.path.getsize(file_path)
         md5_hash = generate_hash(file_path)
-        if md5_hash in seen_hashes and size == seen_hashes[md5_hash][0]:
+        if md5_hash in seen_hashes:
             # This is a duplicate
             os.remove(file_path)
             update_file_status(file, 'deleted')
         else:
             seen_hashes[md5_hash] = (size, file_path)
-            update_file_status(file, 'centralized')
 
 def deduplicate_phase_two(dest_dir, threshold=0.8):
-    files_list = os.listdir(dest_dir)
+    files_list = fetch_centralized_files()
     checked_files = set()  # Keep track of files that have been checked
     for file in files_list:
         file_path = os.path.join(dest_dir, file)
@@ -153,6 +157,7 @@ def deduplicate_phase_two(dest_dir, threshold=0.8):
                         update_file_status(compare_file, 'deleted')
                         checked_files.add(compare_file)
         checked_files.add(file)
+        update_file_status(file, 'deduped')
 
 def levenshtein_similarity(s1, s2):
     """Calculate the normalized Levenshtein similarity of two strings."""
