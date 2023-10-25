@@ -80,12 +80,17 @@ def unpack_zip(zip_path, extract_to):
                 VALUES (?, ?, ?)
             """, (zip_path, status, error_message))
 
+def fetch_unpacked_files():
+    with conn:
+        c.execute("SELECT file_name FROM FileList WHERE status = 'centralized'")
+        return [row[0] for row in c.fetchall()]
+
 def centralize_files(src_dir, dest_dir):
     try:
         files_list = os.listdir(src_dir)
         for file in files_list:
             shutil.move(os.path.join(src_dir, file), os.path.join(dest_dir, file))
-            update_file_status(file_name, 'centralized')
+            update_file_status(file, 'centralized')
         error_message = ''
     except Exception as e:
         status = 'Failed'
