@@ -116,10 +116,10 @@ def generate_file_list(src_dir):
 def generate_hash(file_path):
     hasher = hashlib.md5()
     with open(file_path, 'rb') as f:
-        buf = f.read()
-        hasher.update(buf)
+        for chunk in iter(lambda: f.read(4096), b""):
+            hasher.update(chunk)
     return hasher.hexdigest()
-
+    
 def deduplicate_phase_one(dest_dir):
     seen_hashes = {}  # Dictionary to store seen hashes and their corresponding file paths
     files_list = os.listdir(dest_dir)
@@ -163,30 +163,6 @@ def levenshtein_similarity(s1, s2):
     similarity = 1 - distance / max_len
     return similarity
 
-def unpack_zip(zip_path, extract_to):
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to)
-            for file in os.listdir(extract_to):
-                file_path = os.path.join(extract_to, file)
-                size = os.path.getsize(file_path)
-                md5_hash = generate_hash(file_path)
-                with conn:
-                    c.execute("""
-                        INSERT INTO FileList (file_name, status, size, md5_hash)
-                        VALUES (?, ?, ?, ?)
-                    """, (file, 'extracted', size, md5_hash))
-            status = 'Success'
-            error_message = ''
-    except Exception as e:
-        status = 'Failed'
-        error_message = str(e)
-    finally:
-        with conn:
-            c.execute("""
-                INSERT INTO ZipProcessing (zip_file, status, error_message)
-                VALUES (?, ?, ?)
-            """, (zip_path, status, error_message))
 
 def find_json_sidecar(file_path):
     # Get the directory and base name of the file
@@ -205,7 +181,7 @@ def find_json_sidecar(file_path):
 
 def extract_date_from_filename(filename):
     # Look for a sequence of 8 digits in the filename
-    match = re.search(r'(19|20)\d{6}', filename))
+    match = re.search(r'(19|20)\d{6}', filename)
     if match:
         date_string = match.group(1)
         try:
