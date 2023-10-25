@@ -85,7 +85,7 @@ def centralize_files(src_dir, dest_dir):
         files_list = os.listdir(src_dir)
         for file in files_list:
             shutil.move(os.path.join(src_dir, file), os.path.join(dest_dir, file))
-        update_file_status(file_name, 'centralized')
+            update_file_status(file_name, 'centralized')
         error_message = ''
     except Exception as e:
         status = 'Failed'
@@ -240,6 +240,7 @@ def process_image_exif(file_path):
     
         if not gps_info:
             update_gps_exif(file_path, json_data)
+            
     except Exception as e:
         logging.error(f'Failed to process EXIF data for {file_path}: {str(e)}')
 
@@ -276,7 +277,7 @@ def update_gps_exif(file_path, gps_info, json_data):
     geo_data_exif = json_data.get('geoDataExif', {})
     geo_data = json_data.get('geoData', {})
     
-   if geo_data_exif.get('latitude') and geo_data_exif.get('longitude'):
+    if geo_data_exif.get('latitude') and geo_data_exif.get('longitude'):
         new_gps_data = {
             GPSTAGS['GPSLatitude']: convert_to_degrees(geo_data_exif['latitude']),
             GPSTAGS['GPSLongitude']: convert_to_degrees(geo_data_exif['longitude']),
@@ -327,8 +328,8 @@ def main():
     handle_zips(source_dir, tmp_dir)
     generate_file_list(tmp_dir)
     centralize_files(tmp_dir, destination_dir)
-    deduplicate_phase_one(files_list)
-    deduplicate_phase_two(files_list)
+    deduplicate_phase_one()
+    deduplicate_phase_two()
     process_files(destination_dir)
     print('Processing completed.')  # User update
     logging.info('Processing completed.')
