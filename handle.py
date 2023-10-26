@@ -55,7 +55,18 @@ def handle_zips(source_dir, tmp_dir):
     
     for zip_file in zip_files:
         zip_path = os.path.join(source_dir, zip_file)
-        unpack_zip(zip_path, tmp_dir)
+        if not is_zip_processed(zip_path):  # Skip if already processed successfully
+            unpack_zip(zip_path, tmp_dir)
+        else:
+            print(f'Skipping {zip_path}, already processed.')  # User update
+            logging.info(f'Skipping {zip_path}, already processed.')
+
+def is_zip_processed(zip_path):
+    with conn:
+        c.execute("""
+            SELECT status FROM ZipProcessing WHERE zip_file = ? AND status = 'Success'
+        """, (zip_path,))
+        return c.fetchone() is not None
 
 def unpack_zip(zip_path, extract_to):
     try:
