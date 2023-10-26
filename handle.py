@@ -19,6 +19,9 @@ logging.basicConfig(filename='script.log', level=logging.INFO)
 conn = sqlite3.connect('processing_log.db')
 c = conn.cursor()
 
+def close_db():
+    conn.close()
+
 def create_tables():
     with conn:
         c.execute("""
@@ -87,6 +90,7 @@ def fetch_unpacked_files():
         return [row[0] for row in c.fetchall()]
 
 def centralize_files(src_dir, dest_dir):
+    status = 'Failed'  # Initialize status variable
     try:
         files_list = os.listdir(src_dir)
         for file in files_list:
@@ -347,6 +351,7 @@ def main():
     deduplicate_phase_one()
     deduplicate_phase_two()
     process_files(destination_dir)
+    close_db()
     print('Processing completed.')  # User update
     logging.info('Processing completed.')
 
