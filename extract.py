@@ -11,6 +11,8 @@ from PIL import Image
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime
+import concurrent.futures
+import time
 
 # Setup logging
 logging.basicConfig(filename='photo_processing.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -87,16 +89,25 @@ def create_directory(path):
         print(f"Error: Permission denied. Unable to create directory at {path}. Check permissions.")
         exit(1)
 
+# Retry mechanism for transient errors (e.g., API or DB operations)
+def retry_operation(operation, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            return operation()
+        except Exception as e:
+            logging.warning(f"Operation failed on attempt {attempt+1}: {str(e)}")
+            time.sleep(delay)
+    logging.error(f"Operation failed after {retries} attempts.")
+    return None
+
 # Check if archive is already processed
 def is_archive_processed(archive_name):
-    c.execute("SELECT status FROM ArchiveProcessing WHERE archive_name = ? AND status = 'completed'", (archive_name,))
-    return c.fetchone() is not None
+    return retry_operation(lambda: c.execute("SELECT status FROM ArchiveProcessing WHERE archive_name = ? AND status = 'completed'", (archive_name,)).fetchone())
 
 # Mark archive as processed in the database
 def mark_archive_as_processed(archive_name):
-    with conn:
-        c.execute("INSERT OR REPLACE INTO ArchiveProcessing (archive_name, status) VALUES (?, ?)", (archive_name, 'completed'))
-        conn.commit()
+    retry_operation(lambda: c.execute("INSERT OR REPLACE INTO ArchiveProcessing (archive_name, status) VALUES (?, ?)", (archive_name, 'completed')))
+    conn.commit()
 
 # Extract full archive in batches to avoid memory overload
 def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size=100):
@@ -144,22 +155,30 @@ def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size=100):
 # Process batch: Deduplicate, fix EXIF, move files
 def process_batch(batch, tmp_dir):
     logging.info(f"Processing files in batch: {batch}")
-    for file in batch:
-        file_path = os.path.join(tmp_dir, file)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_file, os.path.join(tmp_dir, file)): file for file in batch}
+        for future in concurrent.futures.as_completed(futures):
+            file = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error processing {file}: {str(e)}")
 
-        # Step 1: Deduplicate
-        if deduplicate_photos(file_path):
-            continue  # Skip duplicates
+# Process a single file: Deduplicate, fix EXIF, move to proper folder
+def process_file(file_path):
+    # Step 1: Deduplicate
+    if deduplicate_photos(file_path):
+        return  # Skip duplicates
 
-        # Step 2: Repair EXIF
-        json_sidecar = find_json_sidecar(file_path)
-        if json_sidecar:
-            with open(json_sidecar, 'r') as f:
-                json_data = json.load(f)
-                repair_exif_data(file_path, json_data)
+    # Step 2: Repair EXIF
+    json_sidecar = find_json_sidecar(file_path)
+    if json_sidecar:
+        with open(json_sidecar, 'r') as f:
+            json_data = json.load(f)
+            repair_exif_data(file_path, json_data)
 
-        # Step 3: Move files to designated folder based on EXIF timestamp
-        move_file_based_on_exif(file_path)
+    # Step 3: Move files to designated folder based on EXIF timestamp
+    move_file_based_on_exif(file_path)
 
 # Deduplicate photos by MD5 hash and check for lower resolution
 def deduplicate_photos(photo_path):
@@ -185,14 +204,12 @@ def generate_hash(file_path):
         return None
 
 def is_duplicate(md5_hash):
-    c.execute("SELECT 1 FROM FileList WHERE md5_hash = ?", (md5_hash,))
-    return c.fetchone() is not None
+    return retry_operation(lambda: c.execute("SELECT 1 FROM FileList WHERE md5_hash = ?", (md5_hash,)).fetchone()) is not None
 
 # Check for lower-resolution duplicate
 def check_for_lower_resolution(photo_path, md5_hash):
     dimensions = get_image_dimensions(photo_path)
-    c.execute("SELECT file_name, width, height FROM FileList WHERE width >= ? AND height >= ?", dimensions)
-    existing_photos = c.fetchall()
+    existing_photos = retry_operation(lambda: c.execute("SELECT file_name, width, height FROM FileList WHERE width >= ? AND height >= ?", dimensions).fetchall())
     if existing_photos:
         logging.info(f"Lower resolution duplicate found for {photo_path}")
         mark_as_duplicate(photo_path)
@@ -208,15 +225,15 @@ def get_image_dimensions(file_path):
         return None
 
 def mark_as_duplicate(photo_path):
-    c.execute("UPDATE FileList SET status = 'duplicate' WHERE file_name = ?", (photo_path,))
+    retry_operation(lambda: c.execute("UPDATE FileList SET status = 'duplicate' WHERE file_name = ?", (photo_path,)))
     conn.commit()
 
 def add_photo_to_db(photo_path, md5_hash, dimensions):
     width, height = dimensions
-    c.execute("""
+    retry_operation(lambda: c.execute("""
         INSERT INTO FileList (file_name, md5_hash, width, height, status)
         VALUES (?, ?, ?, ?, 'processed')
-    """, (photo_path, md5_hash, width, height))
+    """, (photo_path, md5_hash, width, height)))
     conn.commit()
 
 # Repair EXIF data from the Google sidecar JSON
@@ -279,8 +296,14 @@ def move_file_based_on_exif(photo_path):
             year_dir = os.path.join(destination_dir, str(date_obj.year))
             month_dir = os.path.join(year_dir, str(date_obj.month).zfill(2))
             create_directory(month_dir)
-            shutil.move(photo_path, os.path.join(month_dir, os.path.basename(photo_path)))
-            logging.info(f"Moved {photo_path} to {month_dir}")
+
+            # Prevent overwrite by checking for existing files
+            target_path = os.path.join(month_dir, os.path.basename(photo_path))
+            if os.path.exists(target_path):
+                target_path = os.path.join(month_dir, f"{os.path.splitext(os.path.basename(photo_path))[0]}_{int(time.time())}{os.path.splitext(photo_path)[1]}")
+
+            shutil.move(photo_path, target_path)
+            logging.info(f"Moved {photo_path} to {target_path}")
     except Exception as e:
         logging.error(f"Error moving photo {photo_path}: {str(e)}")
 
