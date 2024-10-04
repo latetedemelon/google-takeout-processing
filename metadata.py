@@ -3,6 +3,8 @@ import logging
 import os
 import time
 from datetime import datetime
+import json
+from hashlib import md5
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -26,33 +28,6 @@ def get_google_service(token_path):
     except Exception as e:
         logging.error(f"Error setting up Google Photos API service: {e}")
         raise
-
-# Decorator for handling API errors and rate limiting
-def handle_api_errors_and_rate_limit(func):
-    def wrapper(*args, **kwargs):
-        retries = 3
-        delay = 2
-        for attempt in range(retries):
-            try:
-                result = func(*args, **kwargs)
-                return result
-            except HttpError as e:
-                if e.resp.status == 429:  # Too many requests (rate limiting)
-                    logging.warning(f"Rate limit exceeded. Retrying in {delay * (attempt + 1)} seconds...")
-                    time.sleep(delay * (attempt + 1))
-                else:
-                    logging.error(f"Google Photos API error: {str(e)}")
-                    if attempt < retries - 1:
-                        time.sleep(delay)
-                    else:
-                        raise
-            except Exception as e:
-                logging.error(f"An error occurred: {e}")
-                if attempt < retries - 1:
-                    time.sleep(delay)
-                else:
-                    raise
-    return wrapper
 
 # Fetch Google Photos albums
 @handle_api_errors_and_rate_limit
@@ -123,21 +98,30 @@ def save_photos_in_batches(conn, photos_map):
         logging.error(f"Error saving photo metadata to database: {e}")
         raise
 
-# Fetch and store photos metadata
-def fetch_and_store_google_photos(conn, token_path):
-    try:
-        # Step 1: Initialize the Google Photos API service
-        service = get_google_service(token_path)
 
-        # Step 2: Fetch photo metadata from Google Photos API
-        photos_map = fetch_google_photos_metadata(service)
-
-        # Step 3: Save photo metadata to the database in batches
-        save_photos_in_batches(conn, photos_map)
-        
-        logging.info(f"Fetched and mapped {len(photos_map)} photos from Google API.")
-        
-    except Exception as e:
-        logging.error(f"An error occurred during photo metadata fetching and storing: {e}")
-        raise
-
+# Decorator for handling API errors and rate limiting
+def handle_api_errors_and_rate_limit(func):
+    def wrapper(*args, **kwargs):
+        retries = 3
+        delay = 2
+        for attempt in range(retries):
+            try:
+                result = func(*args, **kwargs)
+                return result
+            except HttpError as e:
+                if e.resp.status == 429:  # Too many requests (rate limiting)
+                    logging.warning(f"Rate limit exceeded. Retrying in {delay * (attempt + 1)} seconds...")
+                    time.sleep(delay * (attempt + 1))
+                else:
+                    logging.error(f"Google Photos API error: {str(e)}")
+                    if attempt < retries - 1:
+                        time.sleep(delay)
+                    else:
+                        raise
+            except Exception as e:
+                logging.error(f"An error occurred: {e}")
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                else:
+                    raise
+    return wrapper
