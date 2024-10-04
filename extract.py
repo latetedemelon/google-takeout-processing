@@ -125,8 +125,10 @@ def handle_google_photos_api_errors(func):
 
 # Fetch Google Photos metadata
 @handle_google_photos_api_errors
-def fetch_google_photos_metadata(albums_map):
+def fetch_google_photos_metadata():
     photos_map = {}
+    albums_map = fetch_albums()  # Ensure we get album data first
+
     try:
         results = service.mediaItems().list(pageSize=100).execute()
         items = results.get('mediaItems', [])
@@ -140,6 +142,7 @@ def fetch_google_photos_metadata(albums_map):
                 'height': item['mediaMetadata'].get('height'),
                 'albums': []  # Albums will be filled later
             }
+            # Map the photo to its album
             for album_id in item.get('albumIds', []):
                 if album_id in albums_map:
                     photo_data['albums'].append(albums_map[album_id])
@@ -148,6 +151,41 @@ def fetch_google_photos_metadata(albums_map):
     except Exception as e:
         logging.error(f"Error fetching Google Photos metadata: {str(e)}")
     return photos_map
+
+# Fetch Google Photos albums
+@handle_google_photos_api_errors
+def fetch_albums():
+    albums_map = {}
+    try:
+        albums_response = service.albums().list(pageSize=50).execute()
+        for album in albums_response.get('albums', []):
+            albums_map[album['id']] = album['title']
+        logging.info(f"Fetched {len(albums_map)} albums.")
+    except Exception as e:
+        logging.error(f"Error fetching Google Photos albums: {str(e)}")
+    return albums_map
+
+# Save Google Photos metadata to DB
+def save_to_db(photos_map):
+    try:
+        with conn:
+            for photo_id, photo_data in photos_map.items():
+                c.execute("""
+                    INSERT OR REPLACE INTO PhotoList (photo_id, filename, creation_time, mime_type, width, height, albums)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    photo_id, 
+                    photo_data['filename'], 
+                    photo_data['creation_time'], 
+                    photo_data['mime_type'], 
+                    photo_data['width'], 
+                    photo_data['height'], 
+                    ', '.join(photo_data['albums'])  # Join album titles
+                ))
+        conn.commit()
+        logging.info("Google Photos metadata saved to DB.")
+    except Exception as e:
+        logging.error(f"Error saving Google Photos metadata to DB: {str(e)}")
 
 # Parallel extraction of archives
 def extract_archives_in_parallel(archives, tmp_dir, batch_size=100):
@@ -160,32 +198,74 @@ def extract_archives_in_parallel(archives, tmp_dir, batch_size=100):
             else:
                 logging.error(f"Error processing archive {archive_name}.")
 
-# Deduplicate photos by MD5 hash and check for lower resolution
-def deduplicate_photos(photo_path):
+# Batch extraction and file processing
+def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size):
+    try:
+        batch_counter = 0
+        files_extracted = 0
+        if archive_path.endswith('.zip'):
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                total_files = len(zip_ref.infolist())
+                for i, file_info in enumerate(zip_ref.infolist()):
+                    zip_ref.extract(file_info, tmp_dir)
+                    files_extracted += 1
+                    if files_extracted % batch_size == 0:
+                        logging.info(f"Processed {batch_counter+1} batches from {archive_path}")
+                        batch_counter += 1
+                    # Process the extracted file after extraction
+                    process_file(os.path.join(tmp_dir, file_info.filename))
+        elif archive_path.endswith('.tgz'):
+            with tarfile.open(archive_path, 'r:gz') as tar_ref:
+                total_files = len(tar_ref.getmembers())
+                for i, tar_info in enumerate(tar_ref.getmembers()):
+                    tar_ref.extract(tar_info, tmp_dir)
+                    files_extracted += 1
+                    if files_extracted % batch_size == 0:
+                        logging.info(f"Processed {batch_counter+1} batches from {archive_path}")
+                        batch_counter += 1
+                    process_file(os.path.join(tmp_dir, tar_info.name))
+        logging.info(f"Finished processing archive {archive_path}")
+        return archive_path
+    except MemoryError:
+        logging.error(f"Memory error while processing large archive: {archive_path}")
+    except Exception as e:
+        logging.error(f"Error extracting archive {archive_path}: {str(e)}")
+    return None
+
+# Process an individual file after extraction
+def process_file(file_path):
+    if file_path.endswith('.json'):
+        handle_json_file(file_path)
+    elif file_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+        handle_photo_file(file_path)
+
+# Handle JSON file (EXIF repair sidecar)
+def handle_json_file(json_file_path):
+    try:
+        with open(json_file_path, 'r') as f:
+            json_data = json.load(f)
+        # Repair EXIF data if required
+        photo_path = json_file_path.replace('.json', '')
+        if os.path.exists(photo_path):
+            repair_exif_data(photo_path, json_data)
+    except Exception as e:
+        logging.error(f"Error processing JSON file {json_file_path}: {str(e)}")
+
+# Handle photo file (deduplication, EXIF repair, move)
+def handle_photo_file(photo_path):
     md5_hash = generate_hash(photo_path)
     size = os.path.getsize(photo_path)
-    if is_duplicate(md5_hash, size):
-        logging.info(f"Duplicate photo skipped: {photo_path}")
-        mark_as_duplicate(photo_path)
-        return True
+    dimensions = get_image_dimensions(photo_path)
+    
+    if not is_duplicate(md5_hash):
+        add_photo_to_db(photo_path, md5_hash, dimensions, size)
+        move_file_based_on_exif(photo_path, destination_dir)
     else:
-        check_for_lower_resolution(photo_path, md5_hash, size)
-        return False
+        logging.info(f"Duplicate found and skipped: {photo_path}")
 
-# Generate MD5 hash
-def generate_hash(file_path):
-    hasher = hashlib.md5()
-    try:
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except Exception as e:
-        logging.error(f"Error generating MD5 hash for {file_path}: {str(e)}")
-        return None
-
-def is_duplicate(md5_hash, size):
-    return retry_operation(lambda: c.execute("SELECT 1 FROM FileList WHERE md5_hash = ? AND size = ?", (md5_hash, size)).fetchone()) is not None
+# Check if photo is a duplicate by MD5 hash
+def is_duplicate(md5_hash):
+    return retry_operation(lambda: c.execute("SELECT 1 FROM FileList WHERE md5_hash = ?", (md5_hash,)).fetchone()) is not None
 
 # Add photo to database after processing
 def add_photo_to_db(photo_path, md5_hash, dimensions, size):
@@ -196,7 +276,7 @@ def add_photo_to_db(photo_path, md5_hash, dimensions, size):
     """, (photo_path, md5_hash, size, width, height)))
     conn.commit()
 
-# Repair EXIF data from the Google sidecar JSON
+# EXIF Data repair from Google sidecar JSON
 def repair_exif_data(photo_path, json_data):
     try:
         metadata = pyexiv2.ImageMetadata(photo_path)
@@ -245,7 +325,7 @@ def repair_exif_data(photo_path, json_data):
     except Exception as e:
         logging.error(f"Error repairing EXIF data for {photo_path}: {str(e)}")
 
-# Step 6: Move files to designated folders based on EXIF data
+# Move files to designated folders based on EXIF data
 def move_file_based_on_exif(photo_path, destination_dir):
     try:
         image = Image.open(photo_path)
@@ -265,6 +345,48 @@ def move_file_based_on_exif(photo_path, destination_dir):
     except Exception as e:
         logging.error(f"Error moving file {photo_path}: {str(e)}")
 
+# Utility: Create directory safely
+def create_directory(path):
+    try:
+        if not os.path.exists(path):
+            os.makedirs(path)
+    except OSError as e:
+        logging.error(f"Permission denied: Unable to create directory at {path}: {str(e)}")
+        print(f"Error: Permission denied. Unable to create directory at {path}. Check permissions.")
+        exit(1)
+
+# Utility: Convert decimal degrees to EXIF format (degrees, minutes, seconds)
+def convert_to_degrees(value):
+    degrees = int(value)
+    minutes = int((value - degrees) * 60)
+    seconds = (value - degrees - minutes / 60) * 3600
+    return (degrees, minutes, seconds)
+
+# Utility: Convert decimal to rational (numerator/denominator) for EXIF format
+def convert_to_rational(value):
+    return (int(value * 100), 100)
+
+# Utility: Generate MD5 hash
+def generate_hash(file_path):
+    hasher = hashlib.md5()
+    try:
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        logging.error(f"Error generating MD5 hash for {file_path}: {str(e)}")
+        return None
+
+# Utility: Get image dimensions
+def get_image_dimensions(file_path):
+    try:
+        image = Image.open(file_path)
+        return image.width, image.height
+    except Exception as e:
+        logging.error(f"Error getting dimensions for {file_path}: {str(e)}")
+        return None
+
 # Main function
 def main():
     logging.info('Script started...')
@@ -274,10 +396,17 @@ def main():
     global destination_dir
     destination_dir = 'path_to_photos_directory'
 
+    # Initialize database and create backup
     initialize_database()
     backup_database()
 
-    # Step 3: Process the takeout archives in parallel batches
+    # Step 1: Fetch Google Photos metadata
+    photos_map = fetch_google_photos_metadata()
+
+    # Step 2: Save to database
+    save_to_db(photos_map)
+
+    # Step 3: Extract archives in parallel
     archives = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
     extract_archives_in_parallel(archives, tmp_dir, batch_size=100)
 
