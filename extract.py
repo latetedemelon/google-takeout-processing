@@ -359,83 +359,98 @@ def process_single_file(conn, file_name, file_path):
         VALUES (?, ?, ?);
     """, (file_name, md5_hash, "extracted"))
 
-# Handle JSON file (EXIF repair)
-def handle_json_file(json_file_path):
+# Extract EXIF data from a file
+def extract_exif(file_path):
+    exif_data = {}
     try:
-        with open(json_file_path, 'r') as f:
-            json_data = json.load(f)
-        photo_path = json_file_path.replace('.json', '')
-        if os.path.exists(photo_path):
-            repair_exif_data(photo_path, json_data)
+        with Image.open(file_path) as img:
+            exif_raw = img._getexif()
+            if exif_raw is not None:
+                exif_data = {TAGS.get(tag, tag): value for tag, value in exif_raw.items()}
+            else:
+                logging.warning(f"No EXIF data found for {file_path}")
+        logging.info(f"EXIF data extracted for {file_path}")
     except Exception as e:
-        logging.error(f"Error processing JSON file {json_file_path}: {e}")
+        logging.warning(f"Failed to extract EXIF data from {file_path}: {e}")
+    
+    return exif_data
 
-# Repair EXIF data
-def repair_exif_data(photo_path, json_data):
+# Repair EXIF data using Google Photos sidecar data (if EXIF is missing or incomplete)
+def repair_exif_from_sidecar(file_path, sidecar_path, exif_data):
     try:
-        metadata = pyexiv2.ImageMetadata(photo_path)
-        metadata.read()
-        # Example: Repair timestamp
-        photo_taken_time = json_data.get('photoTakenTime', {}).get('timestamp')
-        if photo_taken_time:
-            date_taken = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
-            metadata['Exif.Photo.DateTimeOriginal'] = date_taken
-            logging.info(f"Timestamp repaired for {photo_path}: {date_taken}")
-        # Repair GPS (location) data
-        geo_data = json_data.get('geoData', {})
-        geo_data_exif = json_data.get('geoDataExif', {})
+        with open(sidecar_path, 'r') as f:
+            sidecar_data = json.load(f)
+            logging.info(f"Sidecar data loaded for {file_path}")
+            
+        # Repair EXIF fields with sidecar data if missing
+        if 'DateTime' not in exif_data and 'photoTakenTime' in sidecar_data:
+            exif_data['DateTime'] = time.strftime('%Y:%m:%d %H:%M:%S', time.gmtime(int(sidecar_data['photoTakenTime']['timestamp'])))
+            logging.info(f"Repaired missing DateTime EXIF for {file_path} using sidecar")
 
-        latitude = geo_data_exif.get('latitude') or geo_data.get('latitude')
-        longitude = geo_data_exif.get('longitude') or geo_data.get('longitude')
-        altitude = geo_data_exif.get('altitude') or geo_data.get('altitude', 0)
-
-        if latitude and longitude:
-            lat_deg = convert_to_degrees(abs(latitude))
-            lon_deg = convert_to_degrees(abs(longitude))
-
-            metadata['Exif.GPSInfo.GPSLatitude'] = lat_deg
-            metadata['Exif.GPSInfo.GPSLatitudeRef'] = 'N' if latitude >= 0 else 'S'
-            metadata['Exif.GPSInfo.GPSLongitude'] = lon_deg
-            metadata['Exif.GPSInfo.GPSLongitudeRef'] = 'E' if longitude >= 0 else 'W'
-
-            logging.info(f"Location repaired for {photo_path}: ({latitude}, {longitude})")
-
-        if altitude:
-            metadata['Exif.GPSInfo.GPSAltitude'] = convert_to_rational(altitude)
-            metadata['Exif.GPSInfo.GPSAltitudeRef'] = '0'  # '0' indicates altitude above sea level
-
-            logging.info(f"Altitude repaired for {photo_path}: {altitude} meters")
-
-        # Repair description/caption if available
-        description = json_data.get('description')
-        if description:
-            metadata['Exif.Image.ImageDescription'] = description
-            logging.info(f"Description repaired for {photo_path}: {description}")
-
-        metadata.write()
-
+        if 'GPSInfo' not in exif_data and 'geoData' in sidecar_data:
+            exif_data['GPSInfo'] = {
+                'GPSLatitude': sidecar_data['geoData']['latitude'],
+                'GPSLongitude': sidecar_data['geoData']['longitude']
+            }
+            logging.info(f"Repaired missing GPS EXIF for {file_path} using sidecar")
+        
+        return exif_data
     except Exception as e:
-        logging.error(f"Error repairing EXIF data for {photo_path}: {e}")
+        logging.warning(f"Failed to repair EXIF for {file_path} using sidecar: {e}")
+        return exif_data
 
-# Move files to designated folders based on EXIF data
-def move_file_based_on_exif(photo_path, destination_dir):
+# Use file creation time as EXIF creation time if no EXIF and no sidecar data available
+def get_file_creation_time(file_path):
     try:
-        image = Image.open(photo_path)
-        exif_data = image._getexif()
-        if exif_data and 36867 in exif_data:
-            date_taken = exif_data[36867]
-            date_obj = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
-        else:
-            date_obj = datetime.fromtimestamp(os.path.getmtime(photo_path))  # Fallback to modification time
-
-        year_dir = os.path.join(destination_dir, str(date_obj.year))
-        month_dir = os.path.join(year_dir, str(date_obj.month).zfill(2))
-
-        create_directory(month_dir)
-        shutil.move(photo_path, os.path.join(month_dir, os.path.basename(photo_path)))
-
+        creation_time = os.path.getmtime(file_path)
+        return time.strftime('%Y:%m:%d %H:%M:%S', time.gmtime(creation_time))
     except Exception as e:
-        logging.error(f"Error moving file {photo_path}: {e}")
+        logging.error(f"Error getting creation time for {file_path}: {e}")
+        return None
+
+# Process extracted files for EXIF extraction and repair
+def process_exif_for_files(conn, tmp_dir):
+    try:
+        c = conn.cursor()
+
+        for root, dirs, files in os.walk(tmp_dir):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                sidecar_path = file_path + ".json"  # Assuming the sidecar file is named with the same base filename
+                
+                # Extract EXIF
+                exif_data = extract_exif(file_path)
+                
+                # Repair missing fields with sidecar data
+                if not exif_data or 'DateTime' not in exif_data or 'GPSInfo' not in exif_data:
+                    if os.path.exists(sidecar_path):
+                        exif_data = repair_exif_from_sidecar(file_path, sidecar_path, exif_data)
+                
+                # If still no EXIF data, use the file creation time
+                if 'DateTime' not in exif_data:
+                    file_creation_time = get_file_creation_time(file_path)
+                    if file_creation_time:
+                        exif_data['DateTime'] = file_creation_time
+                        logging.info(f"Using file creation time as EXIF DateTime for {file_name}")
+                
+                # Update the database with EXIF data
+                if exif_data:
+                    c.execute("""
+                        UPDATE FileList SET exif_data = ?, status = ?
+                        WHERE file_name = ?;
+                    """, (json.dumps(exif_data), "exif_processed", file_name))
+        
+        conn.commit()
+        logging.info(f"Successfully processed EXIF data and updated the database.")
+    except sqlite3.Error as e:
+        logging.error(f"Database error while processing EXIF data: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Error processing EXIF data: {e}")
+        raise
+
+
+
 
 # Utility: Create directory safely
 def create_directory(path):
