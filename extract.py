@@ -35,7 +35,6 @@ service = build('photoslibrary', 'v1', credentials=creds)
 def initialize_database():
     try:
         with conn:
-            # Create the tables if they don't exist
             c.execute("""
                 CREATE TABLE IF NOT EXISTS PhotoList (
                     photo_id TEXT PRIMARY KEY,
@@ -112,7 +111,6 @@ def fetch_google_photos_metadata(albums_map):
                 'height': item['mediaMetadata'].get('height'),
                 'albums': []  # Albums will be filled later
             }
-            # Map the photo to its album
             for album_id in item.get('albumIds', []):
                 if album_id in albums_map:
                     photo_data['albums'].append(albums_map[album_id])
@@ -161,7 +159,7 @@ def create_directory(path):
         exit(1)
 
 # Step 2: Verify Takeout files using JSON files from the archive (Dry Run / Full Run)
-def verify_takeout_files(source_dir, tmp_dir, dry_run=True):
+def verify_takeout_files(source_dir, tmp_dir, dry_run=True, batch_size=100):
     create_directory(tmp_dir)
     archive_files = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
 
@@ -177,7 +175,7 @@ def verify_takeout_files(source_dir, tmp_dir, dry_run=True):
         if dry_run:
             extract_json_files_only(archive_path, tmp_dir)
         else:
-            extract_full_archive(archive_path, tmp_dir)
+            extract_full_archive_in_batches(archive_path, tmp_dir, batch_size)
 
 # Extract only JSON files from an archive
 def extract_json_files_only(archive_path, tmp_dir):
@@ -205,23 +203,48 @@ def extract_json_files_only(archive_path, tmp_dir):
     except Exception as e:
         logging.error(f"Error extracting JSON files from {archive_path}: {str(e)}")
 
-# Extract full archive (photos and JSON files)
-def extract_full_archive(archive_path, tmp_dir):
+# Extract full archive in batches to avoid memory overload
+def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size=100):
     try:
         if archive_path.endswith('.zip'):
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                zip_ref.extractall(tmp_dir)
-                logging.info(f"Extracted full archive {archive_path}")
+                total_files = len(zip_ref.infolist())
+                for index, file_info in enumerate(zip_ref.infolist()):
+                    zip_ref.extract(file_info, tmp_dir)
+                    logging.info(f"Extracted {file_info.filename} ({index+1}/{total_files})")
+                    if (index + 1) % batch_size == 0:
+                        logging.info(f"Processing batch of {batch_size} files...")
+                        process_batch(tmp_dir)  # Process the batch
+                        clean_up_batch(tmp_dir)
         elif archive_path.endswith('.tgz'):
             with tarfile.open(archive_path, 'r:gz') as tar_ref:
-                tar_ref.extractall(tmp_dir)
-                logging.info(f"Extracted full archive {archive_path}")
+                total_files = len(tar_ref.getmembers())
+                for index, tar_info in enumerate(tar_ref.getmembers()):
+                    tar_ref.extract(tar_info, tmp_dir)
+                    logging.info(f"Extracted {tar_info.name} ({index+1}/{total_files})")
+                    if (index + 1) % batch_size == 0:
+                        logging.info(f"Processing batch of {batch_size} files...")
+                        process_batch(tmp_dir)  # Process the batch
+                        clean_up_batch(tmp_dir)
     except MemoryError:
         logging.error(f"Memory error while processing large archive: {archive_path}")
         print(f"Error: Unable to process large archive {archive_path} due to memory issues.")
         exit(1)
     except Exception as e:
         logging.error(f"Error extracting full archive from {archive_path}: {str(e)}")
+
+# Clean up the batch after processing
+def clean_up_batch(tmp_dir):
+    for root, _, files in os.walk(tmp_dir):
+        for file in files:
+            os.remove(os.path.join(root, file))
+    logging.info("Batch cleaned up.")
+
+# Process batch (placeholder for actual processing logic)
+def process_batch(tmp_dir):
+    # Process the files here (deduplication, EXIF repair, etc.)
+    logging.info(f"Processing files in {tmp_dir}")
+    # Placeholder for actual processing logic (deduplication, EXIF repair, etc.)
 
 # Step 3: Build the database from the JSON files if necessary
 def build_db_from_json(json_dir):
@@ -244,7 +267,6 @@ def process_json_data(json_data):
         albums = ', '.join(album['title'] for album in album_data)
         photo_taken_time = json_data['photoTakenTime']['timestamp']
         
-        # Save to database
         c.execute("""
             INSERT OR REPLACE INTO FileList (file_name, albums, photo_taken_time)
             VALUES (?, ?, ?)
@@ -279,7 +301,6 @@ def is_duplicate(md5_hash):
     c.execute("SELECT 1 FROM FileList WHERE md5_hash = ?", (md5_hash,))
     return c.fetchone() is not None
 
-# Check for lower resolution duplicate
 def check_for_lower_resolution(photo_path, md5_hash):
     dimensions = get_image_dimensions(photo_path)
     c.execute("SELECT file_name, width, height FROM FileList WHERE width >= ? AND height >= ?", dimensions)
@@ -337,18 +358,6 @@ except ImportError:
     print("Error: pyexiv2 is not installed. Please install pyexiv2 to enable EXIF repair.")
     exit(1)
 
-# Convert decimal degrees to EXIF format (degrees, minutes, seconds)
-def convert_to_degrees(value):
-    degrees = int(value)
-    minutes = int((value - degrees) * 60)
-    seconds = (value - degrees - minutes / 60) * 3600
-    return (degrees, minutes, seconds)
-
-# Convert decimal to rational (numerator/denominator) for EXIF format
-def convert_to_rational(value):
-    return (int(value * 100), 100)
-
-# Repair EXIF data from the Google sidecar JSON
 def repair_exif_data(photo_path, json_data):
     try:
         metadata = pyexiv2.ImageMetadata(photo_path)
@@ -365,7 +374,6 @@ def repair_exif_data(photo_path, json_data):
         geo_data = json_data.get('geoData', {})
         geo_data_exif = json_data.get('geoDataExif', {})
 
-        # Use geoDataExif first, fallback to geoData
         latitude = geo_data_exif.get('latitude') or geo_data.get('latitude')
         longitude = geo_data_exif.get('longitude') or geo_data.get('longitude')
         altitude = geo_data_exif.get('altitude') or geo_data.get('altitude', 0)
@@ -393,7 +401,6 @@ def repair_exif_data(photo_path, json_data):
             metadata['Exif.Image.ImageDescription'] = description
             logging.info(f"Description repaired for {photo_path}: {description}")
 
-        # Write back the metadata to the photo
         metadata.write()
 
     except KeyError as e:
@@ -402,7 +409,15 @@ def repair_exif_data(photo_path, json_data):
         logging.error(f"Error repairing EXIF data for {photo_path}: {str(e)}")
         print(f"Error: Could not repair EXIF data for {photo_path}.")
 
+# Helper functions for EXIF repair
+def convert_to_degrees(value):
+    degrees = int(value)
+    minutes = int((value - degrees) * 60)
+    seconds = (value - degrees - minutes / 60) * 3600
+    return (degrees, minutes, seconds)
 
+def convert_to_rational(value):
+    return (int(value * 100), 100)
 
 # Main function
 def main():
@@ -412,22 +427,16 @@ def main():
     tmp_dir = 'path_to_tmp_directory'
     destination_dir = 'path_to_photos_directory'
 
-    # Step 1: Initialize database (create tables if they don't exist)
     initialize_database()
 
-    # Step 2: Backup the database
     backup_database()
 
-    # Step 3: Create map/list of Google Photos
     create_google_photos_map()
 
-    # Step 4: Verify Takeout files (Dry Run or Full Run)
-    verify_takeout_files(source_dir, tmp_dir, dry_run=False)
+    verify_takeout_files(source_dir, tmp_dir, dry_run=False, batch_size=100)
 
-    # Step 5: Build database from JSON files
     build_db_from_json(tmp_dir)
 
-    # Step 6: Process and deduplicate photos
     move_files_to_designated_location(tmp_dir, destination_dir)
 
     conn.close()
