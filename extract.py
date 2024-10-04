@@ -245,115 +245,119 @@ def fetch_and_store_google_photos(conn, token_path):
         logging.error(f"An error occurred during photo metadata fetching and storing: {e}")
         raise
 
-# Error handling for file operations
-def process_file(file_path):
+# Extract archives (ZIP and TGZ) in parallel and process files in batches
+def extract_archives_in_parallel(archives, tmp_dir, conn):
     try:
-        # Process the file (either JSON or photo)
-        if file_path.endswith('.json'):
-            handle_json_file(file_path)
-        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png')):
-            handle_photo_file(file_path)
-    except FileNotFoundError:
-        logging.error(f"File not found: {file_path}")
-    except PermissionError:
-        logging.error(f"Permission denied: {file_path}")
-    except Exception as e:
-        logging.error(f"Unexpected error processing file {file_path}: {e}")
-
-def handle_video_file(file_path):
-    try:
-        parser = createParser(file_path)
-        metadata = extractMetadata(parser)
-        if metadata:
-            # Modify the creation date (example)
-            editor = createEditor(parser)
-            editor.setValue('creation_date', '2024-10-01 10:00:00')
-            editor.save(file_path)
-        
-        logging.info(f"Processed MOV file: {file_path}")
-    except Exception as e:
-        logging.error(f"Error processing MOV file {file_path}: {e}")
-
-# Parallel extraction of archives
-def extract_archives_in_parallel(archives, tmp_dir, batch_size=100):
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(extract_full_archive_in_batches, archive, tmp_dir, batch_size) for archive in archives]
-        for future in concurrent.futures.as_completed(futures):
-            archive_name = future.result()
-            if archive_name:
-                logging.info(f"Archive {archive_name} processed.")
-            else:
-                logging.error(f"Error processing archive {archive_name}.")
-
-# Process an individual archive
-def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size):
-    try:
-        if archive_path.endswith('.zip'):
-            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                for file_info in zip_ref.infolist():
-                    zip_ref.extract(file_info, tmp_dir)
-                    process_file(os.path.join(tmp_dir, file_info.filename))
-        elif archive_path.endswith('.tgz'):
-            with tarfile.open(archive_path, 'r:gz') as tar_ref:
-                for tar_info in tar_ref.getmembers():
-                    tar_ref.extract(tar_info, tmp_dir)
-                    process_file(os.path.join(tmp_dir, tar_info.name))
-        return archive_path
-    except Exception as e:
-        logging.error(f"Error extracting archive {archive_path}: {e}")
-        return None
-
-# Process extracted files
-def process_file(file_path):
-    file_extension = file_path.lower().split('.')[-1]
-
-    # Handle JSON sidecar files
-    if file_extension == 'json':
-        handle_json_file(file_path)
-
-    # Handle common image file formats, including Apple formats (HEIC, HEIF, ProRAW)
-    elif file_extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp', 'raw', 'heic', 'heif', 'dng']:
-        handle_image_file(file_path)
-
-    # Handle video files, including Apple's MOV format
-    elif file_extension in ['mp4', 'mov', 'avi', 'mkv', 'flv', 'wmv']:
-        handle_video_file(file_path)
-
-    # Unsupported file types
-    else:
-        logging.warning(f"Unsupported file type: {file_path}")
-
-
-def handle_image_file(file_path):
-    try:
-        # HEIC/HEIF image EXIF handling
-        if file_path.endswith(('.heic', '.heif')):
-            image = Image.open(file_path)
-            exif_data = image.getexif()  # Extract EXIF data
-            # Modify or add EXIF data
-            exif_data[0x0132] = "2024:10:01 10:00:00"  # Example: Modify date taken
-            image.save(file_path, exif=exif_data.tobytes())  # Save with modified EXIF
+        # Using ThreadPoolExecutor to parallelize archive extraction
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_archive = {executor.submit(extract_and_process_archive, archive, tmp_dir, conn): archive for archive in archives}
             
-            logging.info(f"Processed HEIC/HEIF file: {file_path}")
-        else:
-            logging.info(f"Processed regular image file: {file_path}")
+            for future in concurrent.futures.as_completed(future_to_archive):
+                archive = future_to_archive[future]
+                try:
+                    future.result()  # This will raise any exceptions caught during processing
+                    logging.info(f"Successfully processed {archive}.")
+                except Exception as exc:
+                    logging.error(f"Error processing archive {archive}: {exc}")
+
     except Exception as e:
-        logging.error(f"Error processing image file {file_path}: {e}")
+        logging.error(f"Error during parallel archive extraction: {e}")
+        raise
 
+# Extract and process a single archive (ZIP or TGZ)
+def extract_and_process_archive(archive, tmp_dir, conn):
+    archive_path = os.path.join(tmp_dir, archive)
+    logging.info(f"Extracting {archive_path}...")
+    
+    if archive.endswith('.zip'):
+        extract_zip(archive_path, tmp_dir)
+    elif archive.endswith('.tgz'):
+        extract_tgz(archive_path, tmp_dir)
+    else:
+        logging.warning(f"Unsupported archive format: {archive}")
+        return
+    
+    # After extraction, process the files in this archive
+    process_extracted_files_in_parallel(conn, tmp_dir)
 
-def handle_image_file(file_path):
+# Extract ZIP files
+def extract_zip(archive_path, extract_dir):
     try:
-        # DNG image EXIF handling
-        if file_path.endswith('.dng'):
-            image = Image.open(file_path)
-            exif_data = image.getexif()  # Extract EXIF data
-            # Modify EXIF data
-            exif_data[0x9003] = "2024:10:01 12:00:00"  # Example: Modify DateTimeOriginal
-            image.save(file_path, exif=exif_data.tobytes())  # Save with modified EXIF
-
-            logging.info(f"Processed ProRAW/DNG file: {file_path}")
+        with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+            logging.info(f"Successfully extracted ZIP: {archive_path}")
+    except zipfile.BadZipFile as e:
+        logging.error(f"Bad ZIP file: {archive_path}, Error: {e}")
+        raise
     except Exception as e:
-        logging.error(f"Error processing DNG file {file_path}: {e}")
+        logging.error(f"Error extracting ZIP: {archive_path}, Error: {e}")
+        raise
+
+# Extract TGZ files
+def extract_tgz(archive_path, extract_dir):
+    try:
+        with tarfile.open(archive_path, 'r:gz') as tar_ref:
+            tar_ref.extractall(extract_dir)
+            logging.info(f"Successfully extracted TGZ: {archive_path}")
+    except tarfile.TarError as e:
+        logging.error(f"Bad TGZ file: {archive_path}, Error: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Error extracting TGZ: {archive_path}, Error: {e}")
+        raise
+
+# Generate MD5 hash for a file
+def generate_md5(file_path):
+    hash_md5 = hashlib.md5()
+    try:
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        logging.error(f"Error generating MD5 for {file_path}: {e}")
+        raise
+
+# Process the extracted files: Generate MD5, update DB in parallel
+def process_extracted_files_in_parallel(conn, tmp_dir):
+    try:
+        c = conn.cursor()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_file = {}
+            
+            for root, dirs, files in os.walk(tmp_dir):
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    future = executor.submit(process_single_file, conn, file_name, file_path)
+                    future_to_file[future] = file_name
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                file_name = future_to_file[future]
+                try:
+                    future.result()  # This will raise any exceptions caught during processing
+                    logging.info(f"Successfully processed file: {file_name}")
+                except Exception as exc:
+                    logging.error(f"Error processing file {file_name}: {exc}")
+        
+        conn.commit()
+        logging.info(f"Successfully processed all files in {tmp_dir} and updated the database.")
+    except sqlite3.Error as e:
+        logging.error(f"Database error while processing extracted files: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Error processing extracted files: {e}")
+        raise
+
+# Process a single file: Generate MD5 and update the database
+def process_single_file(conn, file_name, file_path):
+    md5_hash = generate_md5(file_path)
+
+    # Update the database with the MD5 hash and status
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO FileList (file_name, md5_hash, status)
+        VALUES (?, ?, ?);
+    """, (file_name, md5_hash, "extracted"))
 
 # Handle JSON file (EXIF repair)
 def handle_json_file(json_file_path):
