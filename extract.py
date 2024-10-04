@@ -6,6 +6,8 @@ import shutil
 import logging
 import zipfile
 import tarfile
+import pyexiv2
+from PIL.ExifTags import GPSTAGS
 from PIL import Image
 from PIL.ExifTags import TAGS
 from google.oauth2.credentials import Credentials
@@ -335,20 +337,72 @@ except ImportError:
     print("Error: pyexiv2 is not installed. Please install pyexiv2 to enable EXIF repair.")
     exit(1)
 
+# Convert decimal degrees to EXIF format (degrees, minutes, seconds)
+def convert_to_degrees(value):
+    degrees = int(value)
+    minutes = int((value - degrees) * 60)
+    seconds = (value - degrees - minutes / 60) * 3600
+    return (degrees, minutes, seconds)
+
+# Convert decimal to rational (numerator/denominator) for EXIF format
+def convert_to_rational(value):
+    return (int(value * 100), 100)
+
+# Repair EXIF data from the Google sidecar JSON
 def repair_exif_data(photo_path, json_data):
     try:
-        photo_taken_time = json_data['photoTakenTime']['timestamp']
-        date_taken = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
-        
-        # Use pyexiv2 or other EXIF library to update EXIF data
         metadata = pyexiv2.ImageMetadata(photo_path)
         metadata.read()
-        metadata['Exif.Photo.DateTimeOriginal'] = date_taken
+
+        # Repair timestamp
+        photo_taken_time = json_data.get('photoTakenTime', {}).get('timestamp')
+        if photo_taken_time:
+            date_taken = datetime.utcfromtimestamp(int(photo_taken_time)).strftime('%Y:%m:%d %H:%M:%S')
+            metadata['Exif.Photo.DateTimeOriginal'] = date_taken
+            logging.info(f"Timestamp repaired for {photo_path}: {date_taken}")
+
+        # Repair GPS (location) data
+        geo_data = json_data.get('geoData', {})
+        geo_data_exif = json_data.get('geoDataExif', {})
+
+        # Use geoDataExif first, fallback to geoData
+        latitude = geo_data_exif.get('latitude') or geo_data.get('latitude')
+        longitude = geo_data_exif.get('longitude') or geo_data.get('longitude')
+        altitude = geo_data_exif.get('altitude') or geo_data.get('altitude', 0)
+
+        if latitude and longitude:
+            lat_deg = convert_to_degrees(abs(latitude))
+            lon_deg = convert_to_degrees(abs(longitude))
+
+            metadata['Exif.GPSInfo.GPSLatitude'] = lat_deg
+            metadata['Exif.GPSInfo.GPSLatitudeRef'] = 'N' if latitude >= 0 else 'S'
+            metadata['Exif.GPSInfo.GPSLongitude'] = lon_deg
+            metadata['Exif.GPSInfo.GPSLongitudeRef'] = 'E' if longitude >= 0 else 'W'
+
+            logging.info(f"Location repaired for {photo_path}: ({latitude}, {longitude})")
+
+        if altitude:
+            metadata['Exif.GPSInfo.GPSAltitude'] = convert_to_rational(altitude)
+            metadata['Exif.GPSInfo.GPSAltitudeRef'] = '0'  # '0' indicates altitude above sea level
+
+            logging.info(f"Altitude repaired for {photo_path}: {altitude} meters")
+
+        # Repair description/caption if available
+        description = json_data.get('description')
+        if description:
+            metadata['Exif.Image.ImageDescription'] = description
+            logging.info(f"Description repaired for {photo_path}: {description}")
+
+        # Write back the metadata to the photo
         metadata.write()
-        logging.info(f"EXIF data repaired for {photo_path}")
+
+    except KeyError as e:
+        logging.error(f"KeyError in JSON file: {str(e)}")
     except Exception as e:
         logging.error(f"Error repairing EXIF data for {photo_path}: {str(e)}")
         print(f"Error: Could not repair EXIF data for {photo_path}.")
+
+
 
 # Main function
 def main():
