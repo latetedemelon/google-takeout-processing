@@ -320,6 +320,43 @@ def clean_up_batch(batch, tmp_dir):
             os.remove(file_path)
             logging.info(f"Deleted file: {file_path}")
 
+def verify_takeout_files(source_dir, tmp_dir, dry_run=True, batch_size=100):
+    """
+    Function to verify Google Takeout files from archives (.zip and .tgz).
+    In dry run mode, it will only extract JSON files for verification.
+    In full run mode, it will extract all files (photos and JSON).
+    
+    Args:
+        source_dir (str): The directory containing the Google Takeout archives.
+        tmp_dir (str): The temporary directory for extracting files.
+        dry_run (bool): Whether to perform a dry run (only extract JSON files).
+        batch_size (int): Number of files to process in each batch.
+    """
+    
+    # Create the temp directory if it doesn't exist
+    create_directory(tmp_dir)
+    
+    # List all .zip and .tgz files in the source directory
+    archive_files = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
+
+    if dry_run:
+        logging.info("Running in dry-run mode. Only JSON files will be extracted.")
+        print("Dry-run mode: Only JSON files will be extracted.")
+    else:
+        logging.info("Running full extraction mode.")
+        print("Full extraction mode: Photos and JSON files will be processed.")
+
+    # Iterate through each archive
+    for archive_file in archive_files:
+        archive_path = os.path.join(source_dir, archive_file)
+        
+        # Perform extraction based on the mode (dry run or full extraction)
+        if dry_run:
+            extract_json_files_only(archive_path, tmp_dir)
+        else:
+            extract_full_archive_in_batches(archive_path, tmp_dir, batch_size)
+
+
 # Main function
 def main():
     logging.info('Script started...')
