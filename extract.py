@@ -50,6 +50,7 @@ def initialize_database():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_name TEXT,
                     md5_hash TEXT,
+                    size INTEGER,
                     width INTEGER,
                     height INTEGER,
                     status TEXT,
@@ -90,10 +91,10 @@ def create_directory(path):
         exit(1)
 
 # Retry mechanism for transient errors (e.g., API or DB operations)
-def retry_operation(operation, retries=3, delay=2):
+def retry_operation(operation, retries=3, delay=2, *args, **kwargs):
     for attempt in range(retries):
         try:
-            return operation()
+            return operation(*args, **kwargs)
         except Exception as e:
             logging.warning(f"Operation failed on attempt {attempt+1}: {str(e)}")
             time.sleep(delay)
@@ -183,12 +184,13 @@ def process_file(file_path):
 # Deduplicate photos by MD5 hash and check for lower resolution
 def deduplicate_photos(photo_path):
     md5_hash = generate_hash(photo_path)
-    if is_duplicate(md5_hash):
+    size = os.path.getsize(photo_path)
+    if is_duplicate(md5_hash, size):
         logging.info(f"Duplicate photo found: {photo_path}")
         mark_as_duplicate(photo_path)
         return True
     else:
-        check_for_lower_resolution(photo_path, md5_hash)
+        check_for_lower_resolution(photo_path, md5_hash, size)
         return False
 
 # Generate MD5 hash
@@ -203,18 +205,18 @@ def generate_hash(file_path):
         logging.error(f"Error generating MD5 hash for {file_path}: {str(e)}")
         return None
 
-def is_duplicate(md5_hash):
-    return retry_operation(lambda: c.execute("SELECT 1 FROM FileList WHERE md5_hash = ?", (md5_hash,)).fetchone()) is not None
+def is_duplicate(md5_hash, size):
+    return retry_operation(lambda: c.execute("SELECT 1 FROM FileList WHERE md5_hash = ? AND size = ?", (md5_hash, size)).fetchone()) is not None
 
 # Check for lower-resolution duplicate
-def check_for_lower_resolution(photo_path, md5_hash):
+def check_for_lower_resolution(photo_path, md5_hash, size):
     dimensions = get_image_dimensions(photo_path)
     existing_photos = retry_operation(lambda: c.execute("SELECT file_name, width, height FROM FileList WHERE width >= ? AND height >= ?", dimensions).fetchall())
     if existing_photos:
         logging.info(f"Lower resolution duplicate found for {photo_path}")
         mark_as_duplicate(photo_path)
     else:
-        add_photo_to_db(photo_path, md5_hash, dimensions)
+        add_photo_to_db(photo_path, md5_hash, dimensions, size)
 
 def get_image_dimensions(file_path):
     try:
@@ -228,12 +230,12 @@ def mark_as_duplicate(photo_path):
     retry_operation(lambda: c.execute("UPDATE FileList SET status = 'duplicate' WHERE file_name = ?", (photo_path,)))
     conn.commit()
 
-def add_photo_to_db(photo_path, md5_hash, dimensions):
+def add_photo_to_db(photo_path, md5_hash, dimensions, size):
     width, height = dimensions
     retry_operation(lambda: c.execute("""
-        INSERT INTO FileList (file_name, md5_hash, width, height, status)
-        VALUES (?, ?, ?, ?, 'processed')
-    """, (photo_path, md5_hash, width, height)))
+        INSERT INTO FileList (file_name, md5_hash, size, width, height, status)
+        VALUES (?, ?, ?, ?, ?, 'processed')
+    """, (photo_path, md5_hash, size, width, height)))
     conn.commit()
 
 # Repair EXIF data from the Google sidecar JSON
@@ -285,7 +287,7 @@ def repair_exif_data(photo_path, json_data):
     except Exception as e:
         logging.error(f"Error repairing EXIF data for {photo_path}: {str(e)}")
 
-# Move files based on EXIF date
+# Move files based on EXIF date, with a fallback to file creation/modification date
 def move_file_based_on_exif(photo_path):
     try:
         image = Image.open(photo_path)
@@ -293,17 +295,20 @@ def move_file_based_on_exif(photo_path):
         if exif_data and 36867 in exif_data:
             date_taken = exif_data[36867]
             date_obj = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
-            year_dir = os.path.join(destination_dir, str(date_obj.year))
-            month_dir = os.path.join(year_dir, str(date_obj.month).zfill(2))
-            create_directory(month_dir)
+        else:
+            date_obj = datetime.fromtimestamp(os.path.getmtime(photo_path))  # Fallback to modification time
+        
+        year_dir = os.path.join(destination_dir, str(date_obj.year))
+        month_dir = os.path.join(year_dir, str(date_obj.month).zfill(2))
+        create_directory(month_dir)
 
-            # Prevent overwrite by checking for existing files
-            target_path = os.path.join(month_dir, os.path.basename(photo_path))
-            if os.path.exists(target_path):
-                target_path = os.path.join(month_dir, f"{os.path.splitext(os.path.basename(photo_path))[0]}_{int(time.time())}{os.path.splitext(photo_path)[1]}")
+        # Prevent overwrite by checking for existing files
+        target_path = os.path.join(month_dir, os.path.basename(photo_path))
+        if os.path.exists(target_path):
+            target_path = os.path.join(month_dir, f"{os.path.splitext(os.path.basename(photo_path))[0]}_{int(time.time())}{os.path.splitext(photo_path)[1]}")
 
-            shutil.move(photo_path, target_path)
-            logging.info(f"Moved {photo_path} to {target_path}")
+        shutil.move(photo_path, target_path)
+        logging.info(f"Moved {photo_path} to {target_path}")
     except Exception as e:
         logging.error(f"Error moving photo {photo_path}: {str(e)}")
 
@@ -321,6 +326,7 @@ def main():
     
     source_dir = 'path_to_takeout_files'
     tmp_dir = 'path_to_tmp_directory'
+    global destination_dir
     destination_dir = 'path_to_photos_directory'
 
     initialize_database()
