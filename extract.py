@@ -396,22 +396,39 @@ def main():
     global destination_dir
     destination_dir = 'path_to_photos_directory'
 
-    # Initialize database and create backup
+    # Step 1: Initialize the database and create a backup
     initialize_database()
     backup_database()
 
-    # Step 1: Fetch Google Photos metadata
+    # Step 2: Fetch Google Photos metadata
+    # We first get the metadata from Google Photos, including albums and photo info
     photos_map = fetch_google_photos_metadata()
 
-    # Step 2: Save to database
+    # Step 3: Save Google Photos metadata to the database
+    # This metadata will be used later for comparison, deduplication, and album structure preservation
     save_to_db(photos_map)
 
-    # Step 3: Extract archives in parallel
+    # Step 4: Verify and extract Takeout files
+    # Dry-run or full-run (change 'dry_run=True' if just verifying JSON files)
+    verify_takeout_files(source_dir, tmp_dir, dry_run=False)
+
+    # Step 5: Process the JSON files from Takeout for EXIF repairs, deduplication, etc.
+    # Build the database with file information extracted from JSON files (sidecar files)
+    build_db_from_json(tmp_dir)
+
+    # Step 6: Extract and process archives in parallel, handling photo extraction in batches
+    # This step handles both the extraction and the processing of photos, deduplication, and repairs
     archives = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
     extract_archives_in_parallel(archives, tmp_dir, batch_size=100)
 
+    # Step 7: Move photos to the final destination (organized by year/month)
+    # Once all files are processed, move them into their respective directories
+    move_files_to_designated_location(tmp_dir, destination_dir)
+
+    # Step 8: Clean up, close the database connection
     conn.close()
-    logging.info('Script completed.')
+    logging.info('Script completed successfully.')
 
 if __name__ == "__main__":
     main()
+
