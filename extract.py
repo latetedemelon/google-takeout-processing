@@ -11,12 +11,14 @@ from PIL.ExifTags import TAGS
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime
+import time
 
 # Setup logging
-logging.basicConfig(filename='photo_processing.log', level=logging.INFO)
+logging.basicConfig(filename='photo_processing.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define the database connection
 DATABASE_PATH = 'photo_processing.db'
+BACKUP_DATABASE_PATH = 'photo_processing_backup.db'
 
 # Create or connect to the database
 conn = sqlite3.connect(DATABASE_PATH)
@@ -60,6 +62,16 @@ def initialize_database():
         logging.error(f"Error initializing the database: {str(e)}")
         print("Error: Could not initialize the database. Check logs for details.")
         exit(1)
+
+# Backup the database before processing
+def backup_database():
+    try:
+        if os.path.exists(DATABASE_PATH):
+            shutil.copyfile(DATABASE_PATH, BACKUP_DATABASE_PATH)
+            logging.info(f"Database backup created at {BACKUP_DATABASE_PATH}")
+    except Exception as e:
+        logging.error(f"Error creating database backup: {str(e)}")
+        print("Error: Could not backup the database. Check logs for details.")
 
 # Step 1: Create a map/list of photos from Google Photos
 def create_google_photos_map():
@@ -190,6 +202,24 @@ def extract_json_files_only(archive_path, tmp_dir):
         exit(1)
     except Exception as e:
         logging.error(f"Error extracting JSON files from {archive_path}: {str(e)}")
+
+# Extract full archive (photos and JSON files)
+def extract_full_archive(archive_path, tmp_dir):
+    try:
+        if archive_path.endswith('.zip'):
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(tmp_dir)
+                logging.info(f"Extracted full archive {archive_path}")
+        elif archive_path.endswith('.tgz'):
+            with tarfile.open(archive_path, 'r:gz') as tar_ref:
+                tar_ref.extractall(tmp_dir)
+                logging.info(f"Extracted full archive {archive_path}")
+    except MemoryError:
+        logging.error(f"Memory error while processing large archive: {archive_path}")
+        print(f"Error: Unable to process large archive {archive_path} due to memory issues.")
+        exit(1)
+    except Exception as e:
+        logging.error(f"Error extracting full archive from {archive_path}: {str(e)}")
 
 # Step 3: Build the database from the JSON files if necessary
 def build_db_from_json(json_dir):
@@ -331,16 +361,19 @@ def main():
     # Step 1: Initialize database (create tables if they don't exist)
     initialize_database()
 
-    # Step 2: Create map/list of Google Photos
+    # Step 2: Backup the database
+    backup_database()
+
+    # Step 3: Create map/list of Google Photos
     create_google_photos_map()
 
-    # Step 3: Verify Takeout files (Dry Run or Full Run)
+    # Step 4: Verify Takeout files (Dry Run or Full Run)
     verify_takeout_files(source_dir, tmp_dir, dry_run=False)
 
-    # Step 4: Build database from JSON files
+    # Step 5: Build database from JSON files
     build_db_from_json(tmp_dir)
 
-    # Step 5: Process and deduplicate photos
+    # Step 6: Process and deduplicate photos
     move_files_to_designated_location(tmp_dir, destination_dir)
 
     conn.close()
