@@ -230,68 +230,7 @@ def handle_api_errors_and_rate_limit(func):
                     raise
     return wrapper
 
-# Extract archives (ZIP and TGZ) in parallel and process files in batches
-def extract_archives_in_parallel(archives, tmp_dir, conn):
-    try:
-        # Using ThreadPoolExecutor to parallelize archive extraction
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_archive = {executor.submit(extract_and_process_archive, archive, tmp_dir, conn): archive for archive in archives}
-            
-            for future in concurrent.futures.as_completed(future_to_archive):
-                archive = future_to_archive[future]
-                try:
-                    future.result()  # This will raise any exceptions caught during processing
-                    logging.info(f"Successfully processed {archive}.")
-                except Exception as exc:
-                    logging.error(f"Error processing archive {archive}: {exc}")
-
-    except Exception as e:
-        logging.error(f"Error during parallel archive extraction: {e}")
-        raise
-
-# Extract and process a single archive (ZIP or TGZ)
-def extract_and_process_archive(archive, tmp_dir, conn):
-    archive_path = os.path.join(tmp_dir, archive)
-    logging.info(f"Extracting {archive_path}...")
-    
-    if archive.endswith('.zip'):
-        extract_zip(archive_path, tmp_dir)
-    elif archive.endswith('.tgz'):
-        extract_tgz(archive_path, tmp_dir)
-    else:
-        logging.warning(f"Unsupported archive format: {archive}")
-        return
-    
-    # After extraction, process the files in this archive
-    process_extracted_files_in_parallel(conn, tmp_dir)
-
-# Extract ZIP files
-def extract_zip(archive_path, extract_dir):
-    try:
-        with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
-            logging.info(f"Successfully extracted ZIP: {archive_path}")
-    except zipfile.BadZipFile as e:
-        logging.error(f"Bad ZIP file: {archive_path}, Error: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Error extracting ZIP: {archive_path}, Error: {e}")
-        raise
-
-# Extract TGZ files
-def extract_tgz(archive_path, extract_dir):
-    try:
-        with tarfile.open(archive_path, 'r:gz') as tar_ref:
-            tar_ref.extractall(extract_dir)
-            logging.info(f"Successfully extracted TGZ: {archive_path}")
-    except tarfile.TarError as e:
-        logging.error(f"Bad TGZ file: {archive_path}, Error: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Error extracting TGZ: {archive_path}, Error: {e}")
-        raise
-
-# Generate MD5 hash for a file
+# Function to generate MD5 hash for a file
 def generate_md5(file_path):
     hash_md5 = hashlib.md5()
     try:
@@ -303,46 +242,80 @@ def generate_md5(file_path):
         logging.error(f"Error generating MD5 for {file_path}: {e}")
         raise
 
-# Process the extracted files: Generate MD5, update DB in parallel
-def process_extracted_files_in_parallel(conn, tmp_dir):
+# Function to extract ZIP files
+def extract_zip(archive_path, extract_dir):
+    try:
+        with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+            logging.info(f"Successfully extracted ZIP archive: {archive_path}")
+    except Exception as e:
+        logging.error(f"Error extracting ZIP file {archive_path}: {e}")
+        raise
+
+# Function to extract TGZ files
+def extract_tgz(archive_path, extract_dir):
+    try:
+        with tarfile.open(archive_path, 'r:gz') as tar_ref:
+            tar_ref.extractall(extract_dir)
+            logging.info(f"Successfully extracted TGZ archive: {archive_path}")
+    except Exception as e:
+        logging.error(f"Error extracting TGZ file {archive_path}: {e}")
+        raise
+
+# Function to extract archives in parallel (ZIP and TGZ)
+def extract_archives_in_parallel(archives, extract_dir, conn):
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_archive = {executor.submit(extract_and_process_archive, archive, extract_dir, conn): archive for archive in archives}
+            for future in concurrent.futures.as_completed(future_to_archive):
+                archive = future_to_archive[future]
+                try:
+                    future.result()  # Raises exceptions if any occurred during the processing
+                    logging.info(f"Successfully processed {archive}")
+                except Exception as exc:
+                    logging.error(f"Error processing {archive}: {exc}")
+    except Exception as e:
+        logging.error(f"Error during parallel archive extraction: {e}")
+        raise
+
+# Function to extract a single archive and process files for MD5 hash generation
+def extract_and_process_archive(archive, extract_dir, conn):
+    archive_path = os.path.join(extract_dir, archive)
+    
+    if archive.endswith('.zip'):
+        extract_zip(archive_path, extract_dir)
+    elif archive.endswith('.tgz'):
+        extract_tgz(archive_path, extract_dir)
+    else:
+        logging.warning(f"Unsupported archive format: {archive}")
+        return
+    
+    # After extraction, process the extracted files
+    process_extracted_files(conn, extract_dir)
+
+# Function to process extracted files, generate MD5, and update the database
+def process_extracted_files(conn, extract_dir):
     try:
         c = conn.cursor()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_file = {}
-            
-            for root, dirs, files in os.walk(tmp_dir):
-                for file_name in files:
-                    file_path = os.path.join(root, file_name)
-                    future = executor.submit(process_single_file, conn, file_name, file_path)
-                    future_to_file[future] = file_name
-            
-            for future in concurrent.futures.as_completed(future_to_file):
-                file_name = future_to_file[future]
-                try:
-                    future.result()  # This will raise any exceptions caught during processing
-                    logging.info(f"Successfully processed file: {file_name}")
-                except Exception as exc:
-                    logging.error(f"Error processing file {file_name}: {exc}")
-        
+        for root, dirs, files in os.walk(extract_dir):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                md5_hash = generate_md5(file_path)
+                
+                # Insert the file details into the database
+                c.execute("""
+                    INSERT OR REPLACE INTO FileList (file_name, md5_hash, status)
+                    VALUES (?, ?, ?);
+                """, (file_name, md5_hash, "extracted"))
+
         conn.commit()
-        logging.info(f"Successfully processed all files in {tmp_dir} and updated the database.")
+        logging.info(f"Processed files and updated the database for {extract_dir}")
     except sqlite3.Error as e:
-        logging.error(f"Database error while processing extracted files: {e}")
+        logging.error(f"Database error during file processing: {e}")
         raise
     except Exception as e:
         logging.error(f"Error processing extracted files: {e}")
         raise
-
-# Process a single file: Generate MD5 and update the database
-def process_single_file(conn, file_name, file_path):
-    md5_hash = generate_md5(file_path)
-
-    # Update the database with the MD5 hash and status
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO FileList (file_name, md5_hash, status)
-        VALUES (?, ?, ?);
-    """, (file_name, md5_hash, "extracted"))
 
 # Extract EXIF data from a file
 def extract_exif(file_path):
