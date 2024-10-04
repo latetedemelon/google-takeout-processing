@@ -13,6 +13,12 @@ from googleapiclient.discovery import build
 from datetime import datetime
 import concurrent.futures
 import time
+from PIL import Image
+import pillow_heif  # Ensures HEIC support in Pillow
+import hachoir
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
+from hachoir.editor import createEditor
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
@@ -23,12 +29,16 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Define paths in environment variables or config
+# Define paths in environment variables or config file for flexibility
 DATABASE_PATH = os.getenv('DATABASE_PATH', 'photo_processing.db')
 BACKUP_DATABASE_PATH = os.getenv('BACKUP_DATABASE_PATH', 'photo_processing_backup.db')
 TOKEN_PATH = os.getenv('TOKEN_PATH', 'token.json')
+# Setup Google Photos API
+SCOPES = ['https://www.googleapis.com/auth/photoslibrary.readonly']
 
-# Create or connect to the database
+# Function to create or connect to the database
+# conn = get_db_connection(DATABASE_PATH)
+# c = conn.cursor()
 def get_db_connection(db_path):
     try:
         conn = sqlite3.connect(db_path)
@@ -37,12 +47,100 @@ def get_db_connection(db_path):
         logging.error(f"Database connection failed: {e}")
         raise
 
-conn = get_db_connection(DATABASE_PATH)
-c = conn.cursor()
+# Database initialization with indexes
+# initialize_database()
+def initialize_database():
+    try:
+        with conn:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS PhotoList (
+                    photo_id TEXT PRIMARY KEY,
+                    filename TEXT,
+                    creation_time TEXT,
+                    mime_type TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    albums TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS FileList (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_name TEXT,
+                    md5_hash TEXT,
+                    size INTEGER,
+                    width INTEGER,
+                    height INTEGER,
+                    status TEXT,
+                    albums TEXT,
+                    photo_taken_time TEXT
+                )
+            """)
+            # Add indexes for performance optimization
+            c.execute("CREATE INDEX IF NOT EXISTS idx_filelist_md5 ON FileList(md5_hash)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_photolist_time ON PhotoList(creation_time)")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ArchiveProcessing (
+                    archive_name TEXT PRIMARY KEY,
+                    status TEXT
+                )
+            """)
+            logging.info("Database initialized and tables created.")
+    except sqlite3.Error as e:
+        logging.error(f"Error initializing database: {e}")
+        raise
 
-# Setup Google Photos API
-SCOPES = ['https://www.googleapis.com/auth/photoslibrary.readonly']
+# Close the database connection
+# close_db_connection()
+def close_db_connection():
+    try:
+        if conn:
+            conn.close()
+            logging.info("Database connection closed.")
+    except sqlite3.Error as e:
+        log_and_report_error("Failed to close the database connection", e)
 
+# Back up the database
+def backup_database():
+    try:
+        shutil.copy(DATABASE_PATH, BACKUP_DATABASE_PATH)
+        logging.info("Database backup completed.")
+    except Exception as e:
+        logging.error(f"Error backing up the database: {e}")
+        raise
+
+# Error handling for file operations
+def process_file(file_path):
+    try:
+        # Process the file (either JSON or photo)
+        if file_path.endswith('.json'):
+            handle_json_file(file_path)
+        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+            handle_photo_file(file_path)
+    except FileNotFoundError:
+        logging.error(f"File not found: {file_path}")
+    except PermissionError:
+        logging.error(f"Permission denied: {file_path}")
+    except Exception as e:
+        logging.error(f"Unexpected error processing file {file_path}: {e}")
+
+def handle_video_file(file_path):
+    try:
+        parser = createParser(file_path)
+        metadata = extractMetadata(parser)
+        if metadata:
+            # Modify the creation date (example)
+            editor = createEditor(parser)
+            editor.setValue('creation_date', '2024-10-01 10:00:00')
+            editor.save(file_path)
+        
+        logging.info(f"Processed MOV file: {file_path}")
+    except Exception as e:
+        logging.error(f"Error processing MOV file {file_path}: {e}")
+
+
+# Google Photos service setup
+# service = get_google_service(TOKEN_PATH)
 def get_google_service(token_path):
     try:
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -55,29 +153,19 @@ def get_google_service(token_path):
         logging.error(f"Error setting up Google Photos API service: {e}")
         raise
 
-service = get_google_service(TOKEN_PATH)
-
-# Retry mechanism for operations
-def retry_operation(operation, retries=3, delay=2, *args, **kwargs):
-    for attempt in range(retries):
-        try:
-            return operation(*args, **kwargs)
-        except (HttpError, Exception) as e:
-            if attempt < retries - 1:
-                logging.warning(f"Retrying operation after error: {str(e)}")
-                time.sleep(delay)
-            else:
-                logging.error(f"Operation failed after {retries} attempts: {str(e)}")
-                return None
-
-# Handle Google API errors and rate-limiting
-def handle_google_photos_api_errors(func):
+# Decorator for handling API errors and rate limiting
+def handle_api_errors_and_rate_limit(func):
     def wrapper(*args, **kwargs):
         retries = 3
         delay = 2
         for attempt in range(retries):
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                if 'X-RateLimit-Remaining' in result and int(result['X-RateLimit-Remaining']) == 0:
+                    sleep_time = int(result['X-RateLimit-Reset'])
+                    logging.warning(f"Rate limit hit. Sleeping for {sleep_time} seconds.")
+                    time.sleep(sleep_time)
+                return result
             except RefreshError:
                 logging.error("OAuth token expired or invalid. Please refresh credentials.")
                 exit(1)
@@ -93,135 +181,95 @@ def handle_google_photos_api_errors(func):
                         exit(1)
     return wrapper
 
-# Database initialization with indexes
-def initialize_database():
+# Fetch Google Photos albums
+@handle_api_errors_and_rate_limit
+def fetch_albums():
+    albums_map = {}
     try:
-        with conn:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS PhotoList (
-                    photo_id TEXT PRIMARY KEY,
-                    filename TEXT,
-                    creation_time TEXT,
-                    mime_type TEXT,
-                    width INTEGER,
-                    height INTEGER,
-                    albums TEXT
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS FileList (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_name TEXT,
-                    md5_hash TEXT,
-                    size INTEGER,
-                    width INTEGER,
-                    height INTEGER,
-                    status TEXT,
-                    albums TEXT,
-                    photo_taken_time TEXT
-                )
-            """)
-            # Add indexes for performance optimization
-            c.execute("CREATE INDEX IF NOT EXISTS idx_filelist_md5 ON FileList(md5_hash)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_photolist_time ON PhotoList(creation_time)")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS ArchiveProcessing (
-                    archive_name TEXT PRIMARY KEY,
-                    status TEXT
-                )
-            """)
-            logging.info("Database initialized and tables created.")
-    except sqlite3.Error as e:
-        logging.error(f"Error initializing database: {e}")
-        raise
-
-initialize_database()
-
-# Function to back up the database
-def backup_database():
-    try:
-        shutil.copy(DATABASE_PATH, BACKUP_DATABASE_PATH)
-        logging.info("Database backup completed.")
+        albums_response = service.albums().list(pageSize=50).execute()
+        for album in albums_response.get('albums', []):
+            albums_map[album['id']] = album['title']
+        logging.info(f"Fetched {len(albums_map)} albums.")
     except Exception as e:
-        logging.error(f"Error backing up the database: {e}")
-        raise
+        logging.error(f"Error fetching Google Photos albums: {e}")
+    return albums_map
 
-# Handle Google API errors and rate-limiting
-def handle_google_photos_api_errors(func):
-    def wrapper(*args, **kwargs):
-        retries = 3
-        delay = 2
-        for attempt in range(retries):
-            try:
-                return func(*args, **kwargs)
-            except RefreshError:
-                logging.error("OAuth token expired or invalid. Please refresh credentials.")
-                exit(1)
-            except HttpError as e:
-                if e.resp.status == 429:  # Too many requests (rate limiting)
-                    logging.warning("Rate limit exceeded, retrying after delay...")
-                    time.sleep(delay * (attempt + 1))
-                else:
-                    logging.error(f"Google Photos API error: {str(e)}")
-                    if attempt < retries - 1:
-                        time.sleep(delay)
-                    else:
-                        exit(1)
-    return wrapper
-
-# Database initialization with indexes
-def initialize_database():
+# Fetch Google Photos metadata
+@handle_api_errors_and_rate_limit
+def fetch_google_photos_metadata():
+    photos_map = {}
+    albums_map = fetch_albums()  # Get album data first
     try:
-        with conn:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS PhotoList (
-                    photo_id TEXT PRIMARY KEY,
-                    filename TEXT,
-                    creation_time TEXT,
-                    mime_type TEXT,
-                    width INTEGER,
-                    height INTEGER,
-                    albums TEXT
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS FileList (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_name TEXT,
-                    md5_hash TEXT,
-                    size INTEGER,
-                    width INTEGER,
-                    height INTEGER,
-                    status TEXT,
-                    albums TEXT,
-                    photo_taken_time TEXT
-                )
-            """)
-            # Add indexes for performance optimization
-            c.execute("CREATE INDEX IF NOT EXISTS idx_filelist_md5 ON FileList(md5_hash)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_photolist_time ON PhotoList(creation_time)")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS ArchiveProcessing (
-                    archive_name TEXT PRIMARY KEY,
-                    status TEXT
-                )
-            """)
-            logging.info("Database initialized and tables created.")
-    except sqlite3.Error as e:
-        logging.error(f"Error initializing database: {e}")
-        raise
-
-initialize_database()
-
-# Function to back up the database
-def backup_database():
-    try:
-        shutil.copy(DATABASE_PATH, BACKUP_DATABASE_PATH)
-        logging.info("Database backup completed.")
+        results = service.mediaItems().list(pageSize=100).execute()
+        items = results.get('mediaItems', [])
+        for item in items:
+            photo_data = {
+                'id': item['id'],
+                'filename': item['filename'],
+                'creation_time': item['mediaMetadata']['creationTime'],
+                'mime_type': item['mimeType'],
+                'width': item['mediaMetadata'].get('width'),
+                'height': item['mediaMetadata'].get('height'),
+                'albums': []
+            }
+            for album_id in item.get('albumIds', []):
+                if album_id in albums_map:
+                    photo_data['albums'].append(albums_map[album_id])
+            photos_map[item['id']] = photo_data
+        logging.info(f"Fetched {len(photos_map)} Google Photos items.")
     except Exception as e:
-        logging.error(f"Error backing up the database: {e}")
-        raise
+        logging.error(f"Error fetching Google Photos metadata: {e}")
+    return photos_map
 
+# Save metadata to DB with flexibility (batch or transactional insert)
+def save_photos_to_db(photos_map, batch_size=100, transactional=False):
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+
+        if transactional:
+            conn.execute('BEGIN EXCLUSIVE TRANSACTION')
+
+        batch = []
+        for photo_id, photo_data in photos_map.items():
+            batch.append((
+                photo_id, 
+                photo_data['filename'], 
+                photo_data['creation_time'], 
+                photo_data['mime_type'], 
+                photo_data['width'], 
+                photo_data['height'], 
+                ', '.join(photo_data['albums'])  # Join album titles
+            ))
+            if len(batch) == batch_size:
+                cursor.executemany("""
+                    INSERT OR REPLACE INTO PhotoList 
+                    (photo_id, filename, creation_time, mime_type, width, height, albums)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, batch)
+                conn.commit()
+                logging.info(f"Batch of {batch_size} photos saved to DB.")
+                batch.clear()  # Clear batch after saving
+
+        # Save the remaining batch
+        if batch:
+            cursor.executemany("""
+                INSERT OR REPLACE INTO PhotoList 
+                (photo_id, filename, creation_time, mime_type, width, height, albums)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, batch)
+            conn.commit()
+            logging.info(f"Final batch of {len(batch)} photos saved to DB.")
+
+        if transactional:
+            conn.commit()
+
+    except sqlite3.Error as e:
+        if transactional:
+            conn.rollback()  # Rollback if transactional
+        logging.error(f"Error saving photos to DB: {e}")
+    finally:
+        conn.close()
 
 # Parallel extraction of archives
 def extract_archives_in_parallel(archives, tmp_dir, batch_size=100):
@@ -252,75 +300,57 @@ def extract_full_archive_in_batches(archive_path, tmp_dir, batch_size):
         logging.error(f"Error extracting archive {archive_path}: {e}")
         return None
 
-# Fetch Google Photos metadata
-@handle_google_photos_api_errors
-def fetch_google_photos_metadata():
-    photos_map = {}
-    albums_map = fetch_albums()  # Ensure we get album data first
-    try:
-        results = service.mediaItems().list(pageSize=100).execute()
-        items = results.get('mediaItems', [])
-        for item in items:
-            photo_data = {
-                'id': item['id'],
-                'filename': item['filename'],
-                'creation_time': item['mediaMetadata']['creationTime'],
-                'mime_type': item['mimeType'],
-                'width': item['mediaMetadata'].get('width'),
-                'height': item['mediaMetadata'].get('height'),
-                'albums': []
-            }
-            for album_id in item.get('albumIds', []):
-                if album_id in albums_map:
-                    photo_data['albums'].append(albums_map[album_id])
-            photos_map[item['id']] = photo_data
-        logging.info(f"Fetched {len(photos_map)} Google Photos items.")
-    except Exception as e:
-        logging.error(f"Error fetching Google Photos metadata: {e}")
-    return photos_map
-
-# Fetch Google Photos albums
-@handle_google_photos_api_errors
-def fetch_albums():
-    albums_map = {}
-    try:
-        albums_response = service.albums().list(pageSize=50).execute()
-        for album in albums_response.get('albums', []):
-            albums_map[album['id']] = album['title']
-        logging.info(f"Fetched {len(albums_map)} albums.")
-    except Exception as e:
-        logging.error(f"Error fetching Google Photos albums: {e}")
-    return albums_map
-
-# Save metadata to DB
-def save_to_db(photos_map):
-    try:
-        with conn:
-            for photo_id, photo_data in photos_map.items():
-                c.execute("""
-                    INSERT OR REPLACE INTO PhotoList (photo_id, filename, creation_time, mime_type, width, height, albums)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    photo_id, 
-                    photo_data['filename'], 
-                    photo_data['creation_time'], 
-                    photo_data['mime_type'], 
-                    photo_data['width'], 
-                    photo_data['height'], 
-                    ', '.join(photo_data['albums'])  # Join album titles
-                ))
-        conn.commit()
-        logging.info("Google Photos metadata saved to DB.")
-    except Exception as e:
-        logging.error(f"Error saving metadata to DB: {e}")
-
-
 # Process extracted files
 def process_file(file_path):
-    if file_path.endswith('.json'):
+    file_extension = file_path.lower().split('.')[-1]
+
+    # Handle JSON sidecar files
+    if file_extension == 'json':
         handle_json_file(file_path)
-    elif file_path.lower().endswith(('.jpg', '.jpeg', '.png')):
-        handle_photo_file(file_path)
+
+    # Handle common image file formats, including Apple formats (HEIC, HEIF, ProRAW)
+    elif file_extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp', 'raw', 'heic', 'heif', 'dng']:
+        handle_image_file(file_path)
+
+    # Handle video files, including Apple's MOV format
+    elif file_extension in ['mp4', 'mov', 'avi', 'mkv', 'flv', 'wmv']:
+        handle_video_file(file_path)
+
+    # Unsupported file types
+    else:
+        logging.warning(f"Unsupported file type: {file_path}")
+
+
+def handle_image_file(file_path):
+    try:
+        # HEIC/HEIF image EXIF handling
+        if file_path.endswith(('.heic', '.heif')):
+            image = Image.open(file_path)
+            exif_data = image.getexif()  # Extract EXIF data
+            # Modify or add EXIF data
+            exif_data[0x0132] = "2024:10:01 10:00:00"  # Example: Modify date taken
+            image.save(file_path, exif=exif_data.tobytes())  # Save with modified EXIF
+            
+            logging.info(f"Processed HEIC/HEIF file: {file_path}")
+        else:
+            logging.info(f"Processed regular image file: {file_path}")
+    except Exception as e:
+        logging.error(f"Error processing image file {file_path}: {e}")
+
+
+def handle_image_file(file_path):
+    try:
+        # DNG image EXIF handling
+        if file_path.endswith('.dng'):
+            image = Image.open(file_path)
+            exif_data = image.getexif()  # Extract EXIF data
+            # Modify EXIF data
+            exif_data[0x9003] = "2024:10:01 12:00:00"  # Example: Modify DateTimeOriginal
+            image.save(file_path, exif=exif_data.tobytes())  # Save with modified EXIF
+
+            logging.info(f"Processed ProRAW/DNG file: {file_path}")
+    except Exception as e:
+        logging.error(f"Error processing DNG file {file_path}: {e}")
 
 # Handle JSON file (EXIF repair)
 def handle_json_file(json_file_path):
@@ -442,47 +472,65 @@ def get_image_dimensions(file_path):
         logging.error(f"Error getting dimensions for {file_path}: {e}")
         return None
 
+# Utility: User-friendly logging and error reporting
+def log_and_report_error(message, error=None):
+    if error:
+        logging.error(f"{message}: {error}")
+    else:
+        logging.error(f"{message}")
+    print(f"Error: {message}. Check logs for more details.")
+
+# Utility: Retry mechanism with exponential backoff for operations
+def retry_operation(operation, retries=3, delay=2, *args, **kwargs):
+    for attempt in range(retries):
+        try:
+            return operation(*args, **kwargs)
+        except (HttpError, Exception) as e:
+            if attempt < retries - 1:
+                time.sleep(delay * (2 ** attempt))  # Exponential backoff
+                logging.warning(f"Retrying operation after error: {e}")
+            else:
+                logging.error(f"Operation failed after {retries} attempts: {e}")
+                return None
+
 # Main function
 def main():
     logging.info('Script started...')
-    
-    source_dir = 'path_to_takeout_files'
-    tmp_dir = 'path_to_tmp_directory'
+
+    source_dir = os.getenv('SOURCE_DIR', 'path_to_takeout_files')
+    tmp_dir = os.getenv('TMP_DIR', 'path_to_tmp_directory')
     global destination_dir
-    destination_dir = 'path_to_photos_directory'
+    destination_dir = os.getenv('DESTINATION_DIR', 'path_to_photos_directory')
 
-    # Step 1: Initialize the database and create a backup
-    initialize_database()
-    backup_database()
+    try:
+        # Step 1: Initialize the database and create a backup
+        initialize_database()
+        backup_database()
 
-    # Step 2: Fetch Google Photos metadata
-    # We first get the metadata from Google Photos, including albums and photo info
-    photos_map = fetch_google_photos_metadata()
+        # Step 2: Fetch Google Photos metadata
+        photos_map = fetch_google_photos_metadata()
 
-    # Step 3: Save Google Photos metadata to the database
-    # This metadata will be used later for comparison, deduplication, and album structure preservation
-    save_to_db(photos_map)
+        # Step 3: Save Google Photos metadata to the database using batch processing
+        save_photos_in_batches(photos_map)
 
-    # Step 4: Verify and extract Takeout files
-    # Dry-run or full-run (change 'dry_run=True' if just verifying JSON files)
-    verify_takeout_files(source_dir, tmp_dir, dry_run=False)
+        # Step 4: Verify and extract Takeout files (e.g., ZIPs, TGZs)
+        archives = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
+        extract_archives_in_parallel(archives, tmp_dir)
 
-    # Step 5: Process the JSON files from Takeout for EXIF repairs, deduplication, etc.
-    # Build the database with file information extracted from JSON files (sidecar files)
-    build_db_from_json(tmp_dir)
+        # Step 5: Process the JSON files for EXIF repairs, deduplication, etc.
+        process_files_in_dir(tmp_dir)
 
-    # Step 6: Extract and process archives in parallel, handling photo extraction in batches
-    # This step handles both the extraction and the processing of photos, deduplication, and repairs
-    archives = [f for f in os.listdir(source_dir) if f.endswith(('.zip', '.tgz'))]
-    extract_archives_in_parallel(archives, tmp_dir, batch_size=100)
+        # Step 6: Move photos to the final destination (organized by year/month)
+        move_files_to_designated_location(tmp_dir, destination_dir)
 
-    # Step 7: Move photos to the final destination (organized by year/month)
-    # Once all files are processed, move them into their respective directories
-    move_files_to_designated_location(tmp_dir, destination_dir)
+        # Step 7: Clean up, close the database connection
+        close_db_connection()
 
-    # Step 8: Clean up, close the database connection
-    conn.close()
-    logging.info('Script completed successfully.')
+        logging.info('Script completed successfully.')
+        print("Processing completed successfully.")
+    except Exception as e:
+        log_and_report_error("An error occurred during processing", e)
 
 if __name__ == "__main__":
     main()
+
