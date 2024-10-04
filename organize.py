@@ -1,6 +1,6 @@
 import shutil
 
-# Match the files from the temporary table with the Google Photos API map
+# Function to match files with Google Photos API metadata and move them to the final location
 def match_and_move_files(conn, tmp_dir, destination_dir, photos_map):
     try:
         c = conn.cursor()
@@ -41,16 +41,12 @@ def match_and_move_files(conn, tmp_dir, destination_dir, photos_map):
                     WHERE file_name = ?;
                 """, ("moved", new_location, md5_hash, file_name))
 
-                # Update the Google Photos API map with the new status and MD5 hash
-                photos_map[matched_photo_id]['md5_hash'] = md5_hash
-                photos_map[matched_photo_id]['status'] = 'moved'
-
                 logging.info(f"File {file_name} matched with Google Photos metadata and moved to {new_location}")
             else:
                 logging.warning(f"No match found for {file_name} in Google Photos API map.")
 
         conn.commit()
-        logging.info(f"All matched files have been moved, and the database and map have been updated.")
+        logging.info(f"All matched files have been moved and the database updated.")
     except sqlite3.Error as e:
         logging.error(f"Database error during file matching and moving: {e}")
         raise
